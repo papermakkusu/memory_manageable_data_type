@@ -2,17 +2,7 @@ import uuid
 import sys
 import array
 
-class FieldLimitExceededWarning(Warning):
-    """Предупреждение, выбрасываемое при превышении лимита количества полей."""
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
-class MemoryLimitExceededWarning(Warning):
-    """Предупреждение, выбрасываемое при превышении лимита памяти."""
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
 class Node:
     def __init__(self, max_fields=10, memory_limit=None):
