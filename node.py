@@ -1,10 +1,21 @@
 import uuid
 import sys
 import array
-from collections import deque
+
+class FieldLimitExceededWarning(Warning):
+    """Предупреждение, выбрасываемое при превышении лимита количества полей."""
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
+
+class MemoryLimitExceededWarning(Warning):
+    """Предупреждение, выбрасываемое при превышении лимита памяти."""
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
 
 class Node:
-    def __init__(self, max_fields=20, memory_limit=1000000):
+    def __init__(self, max_fields=10, memory_limit=None):
         """
         Конструктор для создания узла данных.
         max_fields — максимальное количество полей в узле.
@@ -45,9 +56,9 @@ class Node:
         for child in self.children.values():
             self.total_memory_usage += child.total_memory_usage  # Суммируем память от дочерних узлов
 
-        # Если превышен лимит памяти, выводим предупреждение и очищаем старые поля
+        # Если превышен лимит памяти, выводим предупреждение и увеличиваем лимит
         if self.memory_limit and self.total_memory_usage > self.memory_limit:
-            self.clean_old_fields()
+            self.raise_memory_limit_warning()
 
     def _get_object_size(self, obj):
         """Рекурсивное вычисление размера объекта (включая вложенные элементы для динамических типов)."""
@@ -69,8 +80,12 @@ class Node:
             self.fields_id[self.fields_count * 16:(self.fields_count + 1) * 16] = self.generate_id_for_field(field_name)
             self.fields_count += 1
         else:
-            # Логика для удаления старого поля или перераспределения памяти
-            self.replace_oldest_field(field_name, data)
+            # Логика для динамического увеличения лимита количества полей
+            warning_message = f"WARNING: Field limit exceeded. Increasing limit from {self.max_fields} to {self.max_fields + 1}."
+            print(warning_message)  # Выводим предупреждение
+            self.max_fields += 1  # Увеличиваем лимит на 1
+            self.data[field_name] = data  # Добавляем поле
+            self.fields_count += 1
 
         self.update_memory_usage()
 
@@ -84,17 +99,16 @@ class Node:
         self.data.pop(oldest_field_name)  # Удаляем старое поле
         self.add_field(field_name, data)  # Добавляем новое
 
-    def clean_old_fields(self):
-        """Очистка старых полей, если память превышает лимит."""
-        while self.total_memory_usage > self.memory_limit and self.fields_count > 0:
-            # Удаляем самое старое поле
-            oldest_field_name = list(self.data.keys())[0]
-            self.data.pop(oldest_field_name)
-            self.fields_count -= 1
-            self.update_memory_usage()
-
-            # Печатаем предупреждение о превышении лимита
-            print(f"WARNING: Memory usage exceeded limit ({self.memory_limit} bytes). Oldest field removed.")
+    def raise_memory_limit_warning(self):
+        """Метод для вывода ясного предупреждения, если память превышена."""
+        # Вычисляем разницу, на которую нужно увеличить лимит
+        additional_memory = self.total_memory_usage - self.memory_limit
+        warning_message = f"WARNING: Memory usage exceeded the specified limit of {self.memory_limit} bytes. " \
+                          f"Current memory usage: {self.total_memory_usage} bytes. Increasing memory limit by {additional_memory} bytes."
+        print(warning_message)  # Выводим сообщение о предупреждении
+        # Увеличиваем лимит памяти на нужную величину
+        self.memory_limit += additional_memory
+        print(f"Memory limit increased to {self.memory_limit} bytes.")
 
     def add_child(self, path, node):
         """Добавление дочернего узла по указанному пути."""
@@ -125,10 +139,11 @@ class Node:
     def __repr__(self):
         return f"DataNode(id={repr(self.id)}, data={repr(self.data)}, memory_usage={self.memory_usage}, total_memory_usage={self.total_memory_usage}, fields_count={self.fields_count}, children={repr(self.children)})"
 
+
 # Пример использования:
 
 # Создаем корневой узел с ограничением на 5 полей и лимитом памяти в 10000 байт
-root = Node()
+root = Node(max_fields=5, memory_limit=10000)
 
 # Добавляем поля различных типов
 root.field_int = 42  # Целое число
