@@ -3,8 +3,8 @@ import sys
 import array
 from collections import deque
 
-class Node:
-    def __init__(self, max_fields=10, memory_limit=None):
+class Store:
+    def __init__(self, max_fields=20, memory_limit=10000000):
         """
         Конструктор для создания узла данных.
         max_fields — максимальное количество полей в узле.
@@ -128,7 +128,7 @@ class Node:
 # Пример использования:
 
 # Создаем корневой узел с ограничением на 5 полей и лимитом памяти в 10000 байт
-root = DataNode(max_fields=5, memory_limit=10000)
+root = Store()
 
 # Добавляем поля различных типов
 root.field_int = 42  # Целое число
