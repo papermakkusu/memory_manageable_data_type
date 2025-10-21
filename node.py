@@ -1,6 +1,7 @@
 import uuid
 import sys
 import array
+import types
 
 
 
@@ -59,6 +60,11 @@ class Node:
         elif isinstance(obj, str):
             # Для строк также учитываем их содержимое
             size += sys.getsizeof(obj)  # Включая строковые символы
+        elif isinstance(obj, types.FunctionType):
+            # Для функции учитываем её размер
+            size += sys.getsizeof(obj.__code__)  # Добавляем размер кода функции
+            size += sys.getsizeof(obj.__defaults__)  # Размер аргументов по умолчанию
+            size += sys.getsizeof(obj.__closure__)  # Размер замкнутых переменных (если есть)
         return size
 
     def add_field(self, field_name, data):
@@ -82,12 +88,6 @@ class Node:
     def generate_id_for_field(self, field_name):
         """Генерация ID для поля (UUID, упакованный в 16 байт)."""
         return uuid.uuid5(self.id, field_name).bytes
-
-    def replace_oldest_field(self, field_name, data):
-        """Заменяем самое старое поле, если лимит превышен."""
-        oldest_field_name = list(self.data.keys())[0]  # Просто пример замены первого поля
-        self.data.pop(oldest_field_name)  # Удаляем старое поле
-        self.add_field(field_name, data)  # Добавляем новое
 
     def raise_memory_limit_warning(self):
         """Метод для вывода ясного предупреждения, если память превышена."""
@@ -135,13 +135,22 @@ class Node:
 # Создаем корневой узел с ограничением на 5 полей и лимитом памяти в 10000 байт
 root = Node(max_fields=5, memory_limit=10000)
 
-# Добавляем поля различных типов
+# Определяем несколько функций для добавления
+def greet():
+    return "Hello!"
+
+def add(a, b):
+    return a + b
+
+# Добавляем поля различных типов, включая функции
 root.field_int = 42  # Целое число
 root.field_str = "Hello, world!"  # Строка
 root.field_list = [1, 2, 3, 4, 5]  # Список
 root.field_dict = {'a': 1, 'b': 2}  # Словарь
 root.field_set = {10, 20, 30}  # Множество
 root.field_tuple = (1, 2, 3)  # Кортеж
+root.field_greet = greet  # Функ
+root.field_greet()
 
 # Проверим, сколько памяти занимает структура
 print(f"Total memory usage for root: {root.get_total_memory_usage()} bytes")
