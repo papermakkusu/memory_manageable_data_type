@@ -1,11 +1,13 @@
 import uuid
 import sys
 import types
-import weakref
 import gc
 import time
 import logging
 import os
+import pickle
+import threading
+from multiprocessing import shared_memory
 
 try:
     import memray
@@ -13,137 +15,204 @@ except ImportError:
     memray = None
 
 
-class Node:
-    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None):
-        """
-        Node — узел данных с контролем памяти, интеграцией с внешним логгером и уникальными UUID полей,
-        которые сохраняются в едином memoryview (fields_id).
 
-        :param max_fields: максимум полей
-        :param memory_limit: лимит памяти, байт
-        :param warn_threshold: доля лимита для предупреждений
-        :param logger: внешний логгер (например, solution.logger или KttLogger)
-        """
-        # Если логгер не передан — создаём локальный fallback
+
+# ---------- Менеджер памяти с настоящей shared memory ----------
+class _MemoryHeap:
+    """
+    Менеджер памяти, хранящий объекты по UUID-указателям
+    в сегментах настоящей shared memory, доступных из разных процессов.
+    """
+    def __init__(self, logger=None):
+        self.lock = threading.Lock()
+        self._shm_map = {}   # uuid -> SharedMemory name
+        self._size_map = {}  # uuid -> размер
         self.logger = logger or self._create_default_logger()
 
-        # базовые параметры
-        self.max_fields = max_fields
-        self.memory_limit = memory_limit
-        self.warn_threshold = warn_threshold
-
-        # данные
-        self.data = {}               # поле -> значение
-        self.field_memory = {}       # поле -> оценка памяти
-        self.field_index = {}        # поле -> индекс в fields_id (0..n-1)
-        self.fields_count = 0
-        self.children = {}           # имя -> Node
-        self.id = uuid.uuid4()
-        self.memory_usage = 0
-        self.total_memory_usage = 0
-        self.last_gc_check = 0
-
-        # единая структура для UUID полей: 16 байт на поле
-        self._fields_id_buf = bytearray(self.max_fields * 16)
-        self.fields_id = memoryview(self._fields_id_buf)
-
-        # Memray related
-        self._memray_tracker = None
-        self._memray_report_path = None
-
-        self.logger.info(f"[INIT] Node {self.id} created with max_fields={max_fields}, memory_limit={memory_limit}")
-        self.update_memory_usage()
-
-    # ---------- Вспомогательные методы ----------
     def _create_default_logger(self):
-        """Создаёт fallback-логгер, если KTT-логгер не был передан."""
-        logger = logging.getLogger(f"Node-{id(self)}")
+        logger = logging.getLogger("MemoryHeap")
         if not logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-                datefmt="%H:%M:%S"
-            )
+            formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
             handler.setFormatter(formatter)
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
         return logger
 
-    # ---------- Механика доступа ----------
+    def _serialize(self, obj):
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _deserialize(self, buf):
+        return pickle.loads(buf)
+
+    def alloc(self, obj):
+        """
+        Сохраняет объект в shared memory и возвращает uuid-указатель.
+        """
+        u = uuid.uuid4()
+        data = self._serialize(obj)
+        size = len(data)
+        shm = shared_memory.SharedMemory(create=True, size=size)
+        shm.buf[:size] = data
+
+        with self.lock:
+            self._shm_map[u] = shm.name
+            self._size_map[u] = size
+
+        self.logger.debug(f"[HEAP] Allocated {u} → {type(obj).__name__} ({size} bytes)")
+        return u
+
+    def read(self, ptr):
+        """
+        Получает объект по UUID из shared memory.
+        """
+        with self.lock:
+            shm_name = self._shm_map.get(ptr)
+            size = self._size_map.get(ptr)
+            if shm_name is None:
+                return None
+        shm = shared_memory.SharedMemory(name=shm_name)
+        buf = bytes(shm.buf[:size])
+        obj = self._deserialize(buf)
+        shm.close()  # не удаляем память, т.к. объект может использоваться в других процессах
+        return obj
+
+    def write(self, ptr, value):
+        """
+        Перезаписывает объект по UUID в shared memory.
+        """
+        with self.lock:
+            shm_name = self._shm_map.get(ptr)
+            if shm_name is None:
+                raise KeyError(f"Invalid memory pointer: {ptr}")
+        data = self._serialize(value)
+        size = len(data)
+        shm = shared_memory.SharedMemory(name=shm_name)
+        if size > shm.size:
+            # объект больше текущего сегмента — пересоздаем shared memory
+            shm.close()
+            shm.unlink()
+            shm = shared_memory.SharedMemory(create=True, size=size)
+            with self.lock:
+                self._shm_map[ptr] = shm.name
+                self._size_map[ptr] = size
+        shm.buf[:size] = data
+        shm.close()
+        self.logger.debug(f"[HEAP] Updated {ptr} → {type(value).__name__} ({size} bytes)")
+
+    def free(self, ptr):
+        """
+        Освобождает сегмент shared memory.
+        """
+        with self.lock:
+            shm_name = self._shm_map.pop(ptr, None)
+            self._size_map.pop(ptr, None)
+        if shm_name:
+            shm = shared_memory.SharedMemory(name=shm_name)
+            shm.close()
+            shm.unlink()
+            self.logger.debug(f"[HEAP] Freed memory at {ptr}")
+
+    def cleanup(self, active_pointers):
+        """
+        Удаляет все объекты, которых нет в active_pointers.
+        """
+        for ptr in list(self._shm_map.keys()):
+            if ptr not in active_pointers:
+                self.logger.debug(f"[HEAP] Auto-free unused pointer {ptr}")
+                self.free(ptr)
+
+    def used(self):
+        """
+        Список всех активных UUID.
+        """
+        with self.lock:
+            return list(self._shm_map.keys())
+
+
+# ---------- Node ----------
+class Node:
+    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None):
+        self.logger = logger or self._create_default_logger()
+        self.heap = _MemoryHeap(self.logger)
+
+        self.max_fields = max_fields
+        self.memory_limit = memory_limit
+        self.warn_threshold = warn_threshold
+
+        self.data = {}              # field_name -> ptr (UUID)
+        self.field_memory = {}      # field_name -> size
+        self.field_index = {}       # field_name -> index in fields_id
+        self.children = {}          # child_name -> Node
+        self.id = uuid.uuid4()
+        self.fields_count = 0
+
+        self.memory_usage = 0
+        self.total_memory_usage = 0
+        self.last_gc_check = 0
+
+        self._fields_id_buf = bytearray(self.max_fields * 16)
+        self.fields_id = memoryview(self._fields_id_buf)
+
+        self._memray_tracker = None
+        self._memray_report_path = None
+
+        self.logger.info(f"[INIT] Node {self.id} created with heap memory model")
+        self.update_memory_usage()
+
+    # ---------- Dot notation ----------
     def __getattr__(self, name):
-        # только при отсутствии атрибута в объекте, добавляем поле в data
+        # если нет системного атрибута, создаём поле автоматически
         if name not in self.data:
             self.add_field(name, None)
-        return self.data[name]
+        return self.get_field_value(name)
 
     def __setattr__(self, name, value):
-        # список системных атрибутов, которые записываем напрямую
         reserved = {
             'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
             'field_index', 'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage',
             'last_gc_check', 'logger', '_memray_tracker', '_memray_report_path',
-            '_fields_id_buf', 'fields_id'
+            '_fields_id_buf', 'fields_id', 'heap'
         }
         if name in reserved:
             super().__setattr__(name, value)
         else:
-            # все остальные записи считаем как добавление/обновление поля
             self.add_field(name, value)
 
-    # ---------- Управление памятью ----------
+    # ---------- Логгер ----------
+    def _create_default_logger(self):
+        logger = logging.getLogger(f"Node-{id(self)}")
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", "%H:%M:%S")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
+
+    # ---------- Подсчёт памяти ----------
     def _get_object_size(self, obj):
-        """Рекурсивная оценка размера объекта (приближённо)."""
         size = sys.getsizeof(obj)
         if isinstance(obj, (list, dict, set, tuple)):
-            size += sum(self._get_object_size(item) for item in obj)
+            size += sum(self._get_object_size(i) for i in obj)
         elif isinstance(obj, str):
             size += len(obj.encode('utf-8'))
-        elif isinstance(obj, types.FunctionType):
-            # может быть None
-            size += sys.getsizeof(obj.__code__) if getattr(obj, "__code__", None) is not None else 0
-            size += sys.getsizeof(obj.__defaults__) if getattr(obj, "__defaults__", None) is not None else 0
-            size += sys.getsizeof(obj.__closure__) if getattr(obj, "__closure__", None) is not None else 0
         elif isinstance(obj, Node):
             size += obj.get_total_memory_usage()
         return size
 
     def update_memory_usage(self):
-        """Обновляет учёт памяти на узле и суммирует детей."""
         self.memory_usage = sum(self.field_memory.values())
-        self.total_memory_usage = self.memory_usage + sum(child.get_total_memory_usage() for child in self.children.values())
+        self.total_memory_usage = self.memory_usage + sum(c.get_total_memory_usage() for c in self.children.values())
+        if self.memory_limit and self.total_memory_usage > self.memory_limit * self.warn_threshold:
+            self.logger.warning(f"[WARN] Node {self.id} memory {self.total_memory_usage}/{self.memory_limit} bytes")
 
-        if self.memory_limit:
-            ratio = self.total_memory_usage / self.memory_limit
-            if ratio > 1:
-                self._raise_memory_limit_warning()
-            elif ratio > self.warn_threshold:
-                self.logger.warning(
-                    f"[WARN] Node {self.id} memory at {self.total_memory_usage} / {self.memory_limit} "
-                    f"({ratio*100:.1f}%)"
-                )
-
-    def _raise_memory_limit_warning(self):
-        """Реакция на превышение лимита: лог, увеличение лимита и (опционально) Memray не стартуем автоматически."""
-        diff = max(0, self.total_memory_usage - (self.memory_limit or 0))
-        self.logger.critical(
-            f"[CRITICAL] Node {self.id} exceeded memory limit! "
-            f"Limit={self.memory_limit}, Used={self.total_memory_usage}. Increasing by {diff} bytes."
-        )
-        if self.memory_limit is None:
-            self.memory_limit = self.total_memory_usage
-        else:
-            self.memory_limit += diff
-        self.logger.info(f"[MEMORY] New limit for {self.id}: {self.memory_limit} bytes")
-
-    # ---------- Работа с UUID полей (fields_id memoryview) ----------
+    # ---------- UUID буфер ----------
     def _ensure_fields_capacity(self, required):
-        """Увеличивает capacity fields_id, если требуется."""
         if required <= self.max_fields:
             return
-        # удваиваем размер до требуемого минимум
         new_max = max(required, self.max_fields * 2)
         new_buf = bytearray(new_max * 16)
-        # копируем старые данные
         new_buf[:len(self._fields_id_buf)] = self._fields_id_buf
         self._fields_id_buf = new_buf
         self.fields_id = memoryview(self._fields_id_buf)
@@ -151,213 +220,171 @@ class Node:
         self.max_fields = new_max
 
     def _write_uuid_at_index(self, index, ubytes):
-        """Записывает 16-байт uuid в буфер по индексу."""
-        start = index * 16
-        end = start + 16
-        self.fields_id[start:end] = ubytes
+        self.fields_id[index * 16:index * 16 + 16] = ubytes
 
     def _clear_uuid_at_index(self, index):
-        start = index * 16
-        end = start + 16
-        self.fields_id[start:end] = b'\x00' * 16
+        self.fields_id[index * 16:index * 16 + 16] = b'\x00' * 16
 
     def _read_uuid_at_index(self, index):
         start = index * 16
         end = start + 16
         return bytes(self.fields_id[start:end])
 
-    def get_field_uuid(self, field_name):
-        """Возвращает uuid.UUID для поля (или None)."""
-        idx = self.field_index.get(field_name)
-        if idx is None:
-            return None
-        raw = self._read_uuid_at_index(idx)
-        try:
-            return uuid.UUID(bytes=raw)
-        except Exception:
-            return None
+    # ---------- Управление полями ----------
+    def add_field(self, field_name, value):
+        if field_name in self.data:
+            return self.set_field_value(field_name, value)
 
+        required = self.fields_count + 1
+        if required > self.max_fields:
+            self._ensure_fields_capacity(required)
+
+        idx = self.fields_count
+        for i in range(self.max_fields):
+            if self._read_uuid_at_index(i) == b'\x00' * 16:
+                idx = i
+                break
+
+        ptr = self.heap.alloc(value)
+        self.data[field_name] = ptr
+        self.field_index[field_name] = idx
+        self._write_uuid_at_index(idx, ptr.bytes)
+
+        size = self._get_object_size(value)
+        self.field_memory[field_name] = size
+        self.fields_count = len(self.data)
+
+        self.logger.info(f"[ADD] Field '{field_name}' at {self.id} ptr={ptr} size={size}")
+        self.update_memory_usage()
+
+        now = time.time()
+        if now - self.last_gc_check > 10:
+            collected = gc.collect()
+            self.logger.debug(f"[GC] Freed {collected} objects")
+            self.last_gc_check = now
+            self.update_memory_usage()
+
+    def set_field_value(self, field_name, value):
+        if field_name not in self.data:
+            return self.add_field(field_name, value)
+        ptr = self.data[field_name]
+        self.heap.write(ptr, value)
+        size = self._get_object_size(value)
+        self.field_memory[field_name] = size
+        self.logger.info(f"[UPDATE] Field '{field_name}' updated (size={size})")
+        self.update_memory_usage()
+
+    def get_field_value(self, field_name):
+        ptr = self.data.get(field_name)
+        return self.heap.read(ptr) if ptr else None
+
+    def remove_field(self, field_name):
+        if field_name not in self.data:
+            return
+        ptr = self.data.pop(field_name)
+        idx = self.field_index.pop(field_name, None)
+        self.heap.free(ptr)
+        if idx is not None:
+            self._clear_uuid_at_index(idx)
+        self.field_memory.pop(field_name, None)
+        self.logger.info(f"[REMOVE] Field '{field_name}' freed ({ptr})")
+        self.fields_count = len(self.data)
+        self.update_memory_usage()
+
+    # ---------- Работа с детьми ----------
+    def add_child(self, name, node):
+        if not isinstance(node, Node):
+            raise TypeError("child must be Node")
+        self.children[name] = node
+        self.logger.info(f"[CHILD] Node {node.id} added as child '{name}'")
+        self.update_memory_usage()
+
+    # ---------- Поиск по UUID ----------
     def find_field_by_uuid(self, u):
-        """
-        Ищет поле по uuid рекурсивно в дереве.
-        Принимает uuid.UUID или 16-байтовый bytes. Возвращает (node, field_name) или None.
-        """
         if isinstance(u, uuid.UUID):
             target = u.bytes
         elif isinstance(u, (bytes, bytearray)):
             if len(u) != 16:
-                raise ValueError("UUID bytes must be 16 bytes long")
+                raise ValueError("UUID must be 16 bytes")
             target = bytes(u)
         else:
-            # попытка создать uuid из строки
-            try:
-                target = uuid.UUID(str(u)).bytes
-            except Exception:
-                raise ValueError("Unsupported uuid format")
+            target = uuid.UUID(str(u)).bytes
 
-        # поиск в текущем узле
         for fname, idx in self.field_index.items():
             if self._read_uuid_at_index(idx) == target:
                 return self, fname
 
-        # поиск в дочерних узлах
         for child in self.children.values():
             res = child.find_field_by_uuid(target)
             if res:
                 return res
-
         return None
 
-    # ---------- Управление полями ----------
-    def add_field(self, field_name, data):
-        """
-        Добавление или обновление поля. При добавлении создаётся UUID для поля,
-        записывается в единую структуру fields_id и сохраняется индекс.
-        """
-        # если поле уже существует — обновляем значение и память
-        if field_name in self.data:
-            self.data[field_name] = data
-            field_size = self._get_object_size(data)
-            self.field_memory[field_name] = field_size
-            self.logger.info(f"[UPDATE] Field '{field_name}' updated on {self.id} ({field_size} bytes)")
-            self.update_memory_usage()
-            return
+    # ---------- Сборка мусора ----------
+    def cleanup_unused_memory(self):
+        active = set(self.data.values())
+        for child in self.children.values():
+            active |= set(child.data.values())
+        self.heap.cleanup(active)
+        gc.collect()
+        self.logger.info(f"[GC] Cleanup done, {len(self.heap.heap)} active objects remain")
 
-        # добавление нового поля
-        # расширяем capacity если нужно (fields_count + 1)
-        required = self.fields_count + 1
-        if required > self.max_fields:
-            # увеличиваем capacity (и max_fields) с помощью helper'а
-            self._ensure_fields_capacity(required)
-
-        # назначаем индекс (берём первый свободный индекс если есть)
-        # простая стратегия: индекс = current fields_count (плотно)
-        idx = self.fields_count
-        # если раньше удалялись поля, возможно доступны нулевые слоты - попробуем найти их
-        for i in range(self.max_fields):
-            raw = self._read_uuid_at_index(i)
-            if raw == b'\x00' * 16:
-                idx = i
-                break
-
-        # создаём уникальный uuid для поля (используем uuid4 чтобы гарантировать уникальность)
-        f_uuid = uuid.uuid4()
-        self._write_uuid_at_index(idx, f_uuid.bytes)
-        self.field_index[field_name] = idx
-
-        # сохраняем данные
-        self.data[field_name] = data
-        field_size = self._get_object_size(data)
-        self.field_memory[field_name] = field_size
-
-        # обновляем счётчики
-        self.fields_count = len(self.data)
-
-        self.logger.info(f"[ADD] Field '{field_name}' added to {self.id} ({field_size} bytes) idx={idx} uuid={f_uuid}")
-        self.update_memory_usage()
-
-        # периодическая сборка мусора (как раньше)
-        now = time.time()
-        if now - self.last_gc_check > 10:
-            collected = gc.collect()
-            self.logger.debug(f"[GC] Garbage collector freed {collected} objects")
-            self.last_gc_check = now
-            self.update_memory_usage()
-
-    def remove_field(self, field_name):
-        """Удаление поля: очищаем данные, память и UUID в единой структуре."""
-        if field_name in self.data:
-            idx = self.field_index.get(field_name)
-            self.logger.info(f"[REMOVE] Field '{field_name}' removed from {self.id}")
-            del self.data[field_name]
-            self.field_memory.pop(field_name, None)
-            if idx is not None:
-                self._clear_uuid_at_index(idx)
-                # удаляем соответствие в field_index
-                # (не сдвигаем индексы других полей — оставляем слоты для повторного использования)
-                # удостоверимся, что удаляем именно тот ключ
-                # если есть другие поля с тем же индексом — это ошибка, но в нашей логике индексы уникальны
-                # удаляем ключ
-                self.field_index = {k: v for k, v in self.field_index.items() if k != field_name}
-            self.fields_count = len(self.data)
-            self.update_memory_usage()
-
-    def add_child(self, name, node):
-        """Добавление дочернего узла."""
-        if not isinstance(node, Node):
-            raise TypeError("child must be Node")
-        self.children[name] = node
-        self.logger.info(f"[CHILD] Node {node.id} added as child '{name}' to {self.id}")
-        self.update_memory_usage()
-
-    def get_total_memory_usage(self):
-        """Возвращает суммарную память с учётом детей (актуализирует счётчики)."""
-        self.update_memory_usage()
-        return self.total_memory_usage
-
-    def get_memory_report(self, deep=False):
-        """Возвращает детализированный отчёт по полям и детям (с uuid и размером)."""
-        report = {
-            'node_id': str(self.id),
-            'fields': {
-                k: {
-                    'size_bytes': v,
-                    'uuid': str(self.get_field_uuid(k)) if self.get_field_uuid(k) else None,
-                    'index': self.field_index.get(k)
-                } for k, v in self.field_memory.items()
-            },
-            'total': f"{self.total_memory_usage} bytes"
-        }
-        if deep and self.children:
-            report['children'] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
-        return report
-
-    # ---------- Memray интеграция ----------
-    def start_memray_tracking(self, path="memray_report.bin"):
-        """Запускает Memray-трекер и сохраняет профиль памяти в бинарный файл."""
+    # ---------- Memray ----------
+    def start_memray_tracking(self, path="memray_trace.bin"):
         if not memray:
-            self.logger.warning("[MEMRAY] Memray not installed — skipping memory tracking.")
+            self.logger.warning("Memray not installed")
             return
-
-        if self._memray_tracker:
-            self.logger.warning("[MEMRAY] Tracker already running.")
-            return
-
         self._memray_report_path = path
         self._memray_tracker = memray.Tracker(path)
         self._memray_tracker.__enter__()
         self.logger.info(f"[MEMRAY] Started tracking → {path}")
 
     def stop_memray_tracking(self):
-        """Останавливает Memray-трекер."""
         if not self._memray_tracker:
-            self.logger.warning("[MEMRAY] Tracker was not active.")
             return
-
         self._memray_tracker.__exit__(None, None, None)
-        self.logger.info(f"[MEMRAY] Tracking stopped. Data saved to {self._memray_report_path}")
+        self.logger.info(f"[MEMRAY] Stopped tracking ({self._memray_report_path})")
         self._memray_tracker = None
 
     def print_memray_report(self, html_path=None):
-        """Генерирует HTML-отчёт с flamegraph на основе собранных данных."""
         if not memray:
-            self.logger.warning("[MEMRAY] Memray not installed — cannot generate report.")
+            self.logger.warning("Memray not installed")
             return
-
         if not self._memray_report_path or not os.path.exists(self._memray_report_path):
-            self.logger.warning("[MEMRAY] No report file found to generate HTML.")
+            self.logger.warning("No Memray report file found")
             return
-
         html_path = html_path or (self._memray_report_path + ".html")
         os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
-        self.logger.info(f"[MEMRAY] HTML report generated: {html_path}")
+        self.logger.info(f"[MEMRAY] HTML report generated → {html_path}")
+
+    # ---------- Отчёты ----------
+    def get_memory_report(self, deep=False):
+        report = {
+            "node_id": str(self.id),
+            "fields": {
+                k: {
+                    "size_bytes": v,
+                    "ptr": str(self.data[k]),
+                    "index": self.field_index.get(k)
+                } for k, v in self.field_memory.items()
+            },
+            "total": f"{self.total_memory_usage} bytes"
+        }
+        if deep and self.children:
+            report["children"] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
+        return report
+
+    def get_total_memory_usage(self):
+        self.update_memory_usage()
+        return self.total_memory_usage
 
     def __repr__(self):
         return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
 
+
 # пример использования
 
-node = Node(memory_limit=3000)
+node = Node(memory_limit=3_000)
 
 node.start_memray_tracking("test_memray.bin")
 
