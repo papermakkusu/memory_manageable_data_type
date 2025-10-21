@@ -1,8 +1,5 @@
 import uuid
 import sys
-import types
-import gc
-import time
 import logging
 import os
 import pickle
@@ -18,29 +15,38 @@ except ImportError:
 
 
 ########################################################################################################################
-# XXX: MemoryHeap Class                                                                                                #
+# XXX: _Heap Class                                                                                                     #
 ########################################################################################################################
-class MemoryHeap:
-    """
-    Менеджер памяти, хранящий объекты по UUID-указателям
-    в сегментах настоящей shared memory, доступных из разных процессов.
-    """
+class _Heap:
+    """ Memory manager that holds unique UUID-pointers to objects in shared memory. Can be accessed by other Python
+    threads and processes. Uses Pickle to serialize objects before pushing them to shared memory as only byte-like
+    structures can be read during IPC"""
+
+    SLAB_SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+
     def __init__(self, logger=None, shared_maps=None):
         self.lock = threading.Lock()
-
-        # Shared dicts (for multi-process)
+        # NOTE: Free slabs
+        self._free_blocks = {size: [] for size in self.SLAB_SIZES}
+        # NOTE: Shared dicts (for multiprocess interactions)
         if shared_maps:
             self._shm_map, self._size_map = shared_maps
         else:
             self._shm_map, self._size_map = {}, {}
-
         self.logger = logger or self._create_default_logger()
-
-        # --- Cleanup all shared memory on process exit ---
+        # NOTE: Cleanup all shared memory on process exit
         atexit.register(self._cleanup_all)
 
+    def _choose_slab_size(self, size):
+        """ Round up to the nearest slab size."""
+        for slab in self.SLAB_SIZES:
+            if size <= slab:
+                return slab
+        # NOTE: Large objects get exact size
+        return size
+
     def _create_default_logger(self):
-        logger = logging.getLogger("MemoryHeap")
+        logger = logging.getLogger("_Heap")
         if not logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
@@ -56,7 +62,7 @@ class MemoryHeap:
         return pickle.loads(buf)
 
     def alloc(self, obj):
-        """Сохраняет объект в shared memory и возвращает uuid-указатель."""
+        """ Stores an object in shared memory and returnes UUID-pointer."""
         u = uuid.uuid4()
         data = self._serialize(obj)
         size = len(data)
@@ -68,11 +74,11 @@ class MemoryHeap:
             self._size_map[str(u)] = size
 
         shm.close()
-        self.logger.debug(f"[HEAP] Allocated {u} → {type(obj).__name__} ({size} bytes)")
+        self.logger.debug(f"[HEAP] Allocated {u} -> {type(obj).__name__} ({size} bytes)")
         return u
 
     def read(self, ptr):
-        """Получает объект по UUID из shared memory."""
+        """ Gets an object by UUID from shared memory."""
         key = str(ptr)
         with self.lock:
             shm_name = self._shm_map.get(key)
@@ -86,7 +92,7 @@ class MemoryHeap:
         return obj
 
     def write(self, ptr, value):
-        """Перезаписывает объект по UUID в shared memory."""
+        """ Writes an object with UUID to shared memory."""
         key = str(ptr)
         with self.lock:
             shm_name = self._shm_map.get(key)
@@ -107,7 +113,7 @@ class MemoryHeap:
         self.logger.debug(f"[HEAP] Updated {ptr} → {type(value).__name__} ({size} bytes)")
 
     def free(self, ptr):
-        """Освобождает сегмент shared memory."""
+        """ Frees up a segment of shared memory."""
         key = str(ptr)
         with self.lock:
             shm_name = self._shm_map.pop(key, None)
@@ -122,18 +128,18 @@ class MemoryHeap:
                 pass
 
     def cleanup(self, active_pointers):
-        """Удаляет все объекты, которых нет в active_pointers."""
+        """ Ramoves all entities not listed in active_pointers."""
         for key in list(self._shm_map.keys()):
             if key not in map(str, active_pointers):
                 self.free(uuid.UUID(key))
 
     def used(self):
-        """Список всех активных UUID."""
+        """ List of all active UUIDs."""
         with self.lock:
             return list(self._shm_map.keys())
 
-    # ---------- Cleanup all shared memory at process exit ----------
     def _cleanup_all(self):
+        """ Cleans up all shared memory at python process exit."""
         with self.lock:
             for key, shm_name in list(self._shm_map.items()):
                 try:
@@ -147,7 +153,6 @@ class MemoryHeap:
             self._size_map.clear()
         self.logger.info("[HEAP] Cleaned up all shared memory")
 
-
 ########################################################################################################################
 # XXX: Node Class                                                                                                      #
 ########################################################################################################################
@@ -160,58 +165,75 @@ class Node:
                  shared_maps=None,
                  data_refs=None):
         self.logger = logger or self._create_default_logger()
-        self.heap = MemoryHeap(self.logger, shared_maps=shared_maps)
-
+        self.heap = _Heap(self.logger, shared_maps=shared_maps)
         self.max_fields = max_fields
         self.memory_limit = memory_limit
         self.warn_threshold = warn_threshold
-
         self.data = {}              # field_name -> ptr (UUID)
         self.field_memory = {}      # field_name -> size
-        self.field_index = {}       # field_name -> index in fields_id
         self.children = {}          # child_name -> Node
         self.id = uuid.uuid4()
         self.fields_count = 0
-
         self.memory_usage = 0
         self.total_memory_usage = 0
-        self.last_gc_check = 0
-
-        self._fields_id_buf = bytearray(self.max_fields * 16)
-        self.fields_id = memoryview(self._fields_id_buf)
-
         self._memray_tracker = None
         self._memray_report_path = None
-
         self.logger.info(f"[INIT] Node {self.id} created with heap memory model")
         self.update_memory_usage()
-
         if data_refs:
             self.data = {k: uuid.UUID(v) for k, v in data_refs.items()}
+        # LRU cache for lazy fields loading, initialize cache safely
+        if '_cache' not in self.__dict__:
+            super().__setattr__('_cache', {})  # dict: field_name -> value
+        if '_cache_digest' not in self.__dict__:
+            super().__setattr__('_cache_digest', {})  # dict: field_name -> last memory hash
 
     @property
     def data_refs(self):
         return {k: str(v) for k, v in self.data.items()}
 
-    # ---------- Dot notation ----------
     def __getattr__(self, name):
+        # Ensure the field exists
         if name not in self.data:
             self.add_field(name, None)
-        return self.get_field_value(name)
+
+        ptr = self.data[name]
+
+        # Safe access to cache and digest
+        cache = super().__getattribute__('_cache')
+        cache_digest = super().__getattribute__('_cache_digest')
+
+        # Read raw bytes from shared memory
+        shm_name = self.heap._shm_map[str(ptr)]
+        size = self.heap._size_map[str(ptr)]
+        shm = shared_memory.SharedMemory(name=shm_name)
+        buf = bytes(shm.buf[:size])
+        shm.close()
+
+        digest = hash(buf)
+
+        # Return cached value if memory hasn't changed
+        if name in cache and cache_digest.get(name) == digest:
+            return cache[name]
+
+        # Otherwise deserialize and update cache
+        value = self.heap._deserialize(buf)
+        cache[name] = value
+        cache_digest[name] = digest
+
+        return value
 
     def __setattr__(self, name, value):
         reserved = {
-            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
-            'field_index', 'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage',
-            'last_gc_check', 'logger', '_memray_tracker', '_memray_report_path',
-            '_fields_id_buf', 'fields_id', 'heap'
+            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory', 'fields_count', 'children', 'id',
+            'memory_usage', 'total_memory_usage', 'logger', '_memray_tracker', '_memray_report_path', 'heap', '_cache',
+            '_cache_digest',
         }
         if name in reserved:
             super().__setattr__(name, value)
         else:
             self.add_field(name, value)
 
-    # ---------- Логгер ----------
     def _create_default_logger(self):
         logger = logging.getLogger(f"Node-{id(self)}")
         if not logger.handlers:
@@ -222,7 +244,6 @@ class Node:
             logger.setLevel(logging.INFO)
         return logger
 
-    # ---------- Подсчёт памяти ----------
     def _get_object_size(self, obj):
         size = sys.getsizeof(obj)
         if isinstance(obj, (list, dict, set, tuple)):
@@ -239,14 +260,12 @@ class Node:
         if self.memory_limit and self.total_memory_usage > self.memory_limit * self.warn_threshold:
             self.logger.warning(f"[WARN] Node {self.id} memory {self.total_memory_usage}/{self.memory_limit} bytes")
 
-    # ---------- Управление полями ----------
     def add_field(self, field_name, value):
         if field_name in self.data:
             return self.set_field_value(field_name, value)
         ptr = self.heap.alloc(value)
         self.data[field_name] = ptr
         self.field_memory[field_name] = self._get_object_size(value)
-        self.field_index[field_name] = len(self.field_index)
         self.fields_count = len(self.data)
         self.update_memory_usage()
 
@@ -262,7 +281,28 @@ class Node:
         ptr = self.data.get(field_name)
         return self.heap.read(ptr) if ptr else None
 
-    # ---------- Memray ----------
+    def get_memory_report(self, deep=False):
+        report = {
+            "node_id": str(self.id),
+            "fields": {
+                k: {
+                    "size_bytes": v,
+                    "ptr": str(self.data[k]),
+                } for k, v in self.field_memory.items()
+            },
+            "total": f"{self.total_memory_usage} bytes"
+        }
+        if deep and self.children:
+            report["children"] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
+        return report
+
+    ####################################################################################################################
+    # XXX:  Memray management                                                                                          #
+    ####################################################################################################################
+    def get_total_memory_usage(self):
+        self.update_memory_usage()
+        return self.total_memory_usage
+
     def start_memray_tracking(self, path="memray_trace.bin"):
         if not memray:
             self.logger.warning("Memray not installed")
@@ -290,34 +330,16 @@ class Node:
         os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
         self.logger.info(f"[MEMRAY] HTML report generated → {html_path}")
 
-    def get_memory_report(self, deep=False):
-        report = {
-            "node_id": str(self.id),
-            "fields": {
-                k: {
-                    "size_bytes": v,
-                    "ptr": str(self.data[k]),
-                    "index": self.field_index.get(k)
-                } for k, v in self.field_memory.items()
-            },
-            "total": f"{self.total_memory_usage} bytes"
-        }
-        if deep and self.children:
-            report["children"] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
-        return report
-
-    def get_total_memory_usage(self):
-        self.update_memory_usage()
-        return self.total_memory_usage
-
 
 if __name__ == "__main__":
 
-    # ---------- Example: Multi-process test ----------
+    ####################################################################################################################
+    # XXX:  Examples                                                                                                   #
+    ####################################################################################################################
     def child(shared_maps, data_refs):
         node = Node(shared_maps=shared_maps, data_refs=data_refs)
         print("\n[Child] Modifying shared data...")
-        node.field_str = "Modified by child!"
+        node.field_str = "Hello, child!"
 
     manager = Manager()
     shared_maps = (manager.dict(), manager.dict())
@@ -328,7 +350,7 @@ if __name__ == "__main__":
     print("\n[Parent] Before child modification:")
     print(node.field_str)
 
-    # Access same shared memory from child process
+    # NOTE: Access same shared memory from child process
     p = Process(target=child, args=(shared_maps, node.data_refs))
     p.start()
     p.join()
