@@ -207,16 +207,7 @@ node = Node(memory_limit=5_000_000)
 node.start_memray_tracking("test_memray.bin")
 
 # создаём нагрузку
-node.add_field("big_list", [x for x in range(10_0000)])
-
-node.stop_memray_tracking()
-node.print_memray_report("test_report.html")
-
-print(node.get_memory_report())
-print()
-print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
-
-# Добавляем поля различных типов
+node.big_list = [x for x in range(10_0000)])
 node.field_int = 42  # Целое число
 node.field_str = "Hello, world!"  # Строка
 node.field_list = [1, 2, 3, 4, 5]  # Список
@@ -224,10 +215,11 @@ node.field_dict = {'a': 1, 'b': 2}  # Словарь
 node.field_set = {10, 20, 30}  # Множество
 node.field_tuple = (1, 2, 3)  # Кортеж
 
+node.stop_memray_tracking()
+node.print_memray_report("test_report.html")
+
 # Проверим, сколько памяти занимает структура
 print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
 
-# Печатаем структуру данных
-print(node)
-print()
+# Печатаем структуру данных с детализацией памяти
 print(node.get_memory_report())
