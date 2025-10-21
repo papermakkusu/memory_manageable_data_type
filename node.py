@@ -5,6 +5,12 @@ import weakref
 import gc
 import time
 import logging
+import os
+
+try:
+    import memray
+except ImportError:
+    memray = None
 
 
 class Node:
@@ -31,6 +37,10 @@ class Node:
         self.memory_usage = 0
         self.total_memory_usage = 0
         self.last_gc_check = 0
+
+        # Новые поля для Memray
+        self._memray_tracker = None
+        self._memray_report_path = None
 
         self.logger.info(f"[INIT] Node {self.id} created with max_fields={max_fields}, memory_limit={memory_limit}")
         self.update_memory_usage()
@@ -59,7 +69,7 @@ class Node:
     def __setattr__(self, name, value):
         if name in {'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
                     'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage',
-                    'last_gc_check', 'logger'}:
+                    'last_gc_check', 'logger', '_memray_tracker', '_memray_report_path'}:
             super().__setattr__(name, value)
         else:
             self.add_field(name, value)
@@ -147,36 +157,77 @@ class Node:
             report['children'] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
         return report
 
+    # ---------- Новые методы: интеграция с Memray ----------
+    def start_memray_tracking(self, path="memray_report.bin"):
+        """Запускает Memray-трекер и сохраняет профиль памяти в бинарный файл."""
+        if not memray:
+            self.logger.warning("[MEMRAY] Memray not installed — skipping memory tracking.")
+            return
+
+        if self._memray_tracker:
+            self.logger.warning("[MEMRAY] Tracker already running.")
+            return
+
+        self._memray_report_path = path
+        self._memray_tracker = memray.Tracker(path)
+        self._memray_tracker.__enter__()
+        self.logger.info(f"[MEMRAY] Started tracking → {path}")
+
+    def stop_memray_tracking(self):
+        """Останавливает Memray-трекер."""
+        if not self._memray_tracker:
+            self.logger.warning("[MEMRAY] Tracker was not active.")
+            return
+
+        self._memray_tracker.__exit__(None, None, None)
+        self.logger.info(f"[MEMRAY] Tracking stopped. Data saved to {self._memray_report_path}")
+        self._memray_tracker = None
+
+    def print_memray_report(self, html_path=None):
+        """Генерирует HTML-отчёт с flamegraph на основе собранных данных."""
+        if not memray:
+            self.logger.warning("[MEMRAY] Memray not installed — cannot generate report.")
+            return
+
+        if not self._memray_report_path or not os.path.exists(self._memray_report_path):
+            self.logger.warning("[MEMRAY] No report file found to generate HTML.")
+            return
+
+        html_path = html_path or (self._memray_report_path + ".html")
+        os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
+        self.logger.info(f"[MEMRAY] HTML report generated: {html_path}")
+
     def __repr__(self):
         return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
 
+node = Node(memory_limit=5_000_000)
 
-# Пример использования:
+node.start_memray_tracking("test_memray.bin")
 
-# Создаем корневой узел с ограничением на 5 полей и лимитом памяти в 10000 байт
-root = Node(max_fields=5, memory_limit=1000)
+# создаём нагрузку
+node.add_field("big_list", [x for x in range(10_0000)])
 
-# Определяем несколько функций для добавления
-def greet():
-    return "Hello!"
+node.stop_memray_tracking()
+node.print_memray_report("test_report.html")
 
-def add(a, b):
-    return a + b
+print(node.get_memory_report())
+print()
+print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
 
 # Добавляем поля различных типов, включая функции
-root.field_int = 42  # Целое число
-root.field_str = "Hello, world!"  # Строка
-root.field_list = [1, 2, 3, 4, 5]  # Список
-root.field_dict = {'a': 1, 'b': 2}  # Словарь
-root.field_set = {10, 20, 30}  # Множество
-root.field_tuple = (1, 2, 3)  # Кортеж
-root.field_greet = greet  # Функ
-root.field_greet()
+node.field_int = 42  # Целое число
+node.field_str = "Hello, world!"  # Строка
+node.field_list = [1, 2, 3, 4, 5]  # Список
+node.field_dict = {'a': 1, 'b': 2}  # Словарь
+node.field_set = {10, 20, 30}  # Множество
+node.field_tuple = (1, 2, 3)  # Кортеж
+node.field_greet = greet  # Функ
+node.field_greet()
 
 # Проверим, сколько памяти занимает структура
-print(f"Total memory usage for root: {root.get_total_memory_usage()} bytes")
+print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
 
 # Печатаем структуру данных
-print(root)
+print(node)
 print()
-print(root.get_memory_report())
+print(node.get_memory_report())
