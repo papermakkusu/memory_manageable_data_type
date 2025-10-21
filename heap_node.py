@@ -37,35 +37,64 @@ class Heap:
         """
         shared_maps expected as a dict-like or tuple:
           tuple: (shm_map, size_map, version_map, refcount_map, lock, event_map)
-          dict: keys 'shm_map','size_map','version_map','refcount_map','lock','event_map'
-        If shared_maps is None then local (single-process) dicts are used.
+          or legacy 2-tuple: (shm_map, size_map)
+          If shared_maps is None then manager-backed maps are created (so child processes can attach).
         """
         self.logger = logger or self._create_default_logger()
+
         # local lock for intra-process operations (fallback)
         self._local_lock = threading.RLock()
+        # optional cross-process lock (initialized to None or manager.RLock if manager available)
+        self._cross_lock = None
 
-        # normalize maps
-        if shared_maps is None:
-            self._shm_map = {}
-            self._size_map = {}
-            self._version_map = {}
-            self._refcount_map = {}
-            self._cross_lock = None
-            self._event_map = {}
-        else:
-            if isinstance(shared_maps, (tuple, list)):
-                (self._shm_map, self._size_map,
-                 self._version_map, self._refcount_map,
-                 self._cross_lock, self._event_map) = shared_maps
-            elif isinstance(shared_maps, dict):
-                self._shm_map = shared_maps.get("shm_map")
-                self._size_map = shared_maps.get("size_map")
-                self._version_map = shared_maps.get("version_map")
-                self._refcount_map = shared_maps.get("refcount_map")
-                self._cross_lock = shared_maps.get("lock")
-                self._event_map = shared_maps.get("event_map")
+        # Normalize shared maps and ensure all maps the Heap uses exist.
+        # We prefer manager-backed dicts to allow child processes to inspect maps.
+        if shared_maps:
+            # support both legacy 2-tuple and new 6-tuple formats
+            if len(shared_maps) == 2:
+                # legacy: only shm_map & size_map given; create the rest using a Manager
+                self._shm_map, self._size_map = shared_maps
+                manager = Manager()
+                self._version_map = manager.dict()
+                self._refcount_map = manager.dict()
+                self._event_map = manager.dict()
+                self._free_blocks = manager.dict()
+                # provide cross-process lock via manager
+                try:
+                    self._cross_lock = manager.RLock()
+                except Exception:
+                    self._cross_lock = None
+            elif len(shared_maps) == 6:
+                (self._shm_map,
+                 self._size_map,
+                 self._version_map,
+                 self._refcount_map,
+                 self._event_map,
+                 self._free_blocks) = shared_maps
+                # if a Manager is present in these maps, try to get a cross-process lock via Manager
+                try:
+                    # best-effort: create a manager RLock if Manager is present
+                    manager = Manager()
+                    self._cross_lock = manager.RLock()
+                except Exception:
+                    self._cross_lock = None
             else:
-                raise TypeError("shared_maps must be tuple/list/dict or None")
+                raise ValueError("shared_maps must have 2 or 6 elements")
+        else:
+            # No shared_maps provided: create manager-backed maps for multi-process friendliness
+            manager = Manager()
+            self._shm_map = manager.dict()
+            self._size_map = manager.dict()
+            self._version_map = manager.dict()
+            self._refcount_map = manager.dict()
+            self._event_map = manager.dict()
+            self._free_blocks = manager.dict()
+            try:
+                self._cross_lock = manager.RLock()
+            except Exception:
+                self._cross_lock = None
+
+        self.logger.info("[Heap] initialized")
 
         # GC thread
         self._gc_stop = threading.Event()
@@ -321,184 +350,237 @@ class Heap:
         self.logger.info("[cleanup_all] done")
 
 
-# ---------------------- Node ----------------------
 class Node:
-    """
-    Node uses Heap internally. Dot notation backed by shared memory pointers.
-    """
-    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8,
-                 logger=None, shared_maps=None, data_refs=None):
+    def __init__(self,
+                 max_fields=10,
+                 memory_limit=None,
+                 warn_threshold=0.8,
+                 logger=None,
+                 shared_maps=None,
+                 data_refs=None):
         self.logger = logger or self._create_default_logger()
+        # NOTE: keep your heap initialization (name may vary in your code)
         self.heap = Heap(self.logger, shared_maps=shared_maps)
+
         self.max_fields = max_fields
         self.memory_limit = memory_limit
         self.warn_threshold = warn_threshold
 
-        self.data = {}           # field_name -> uuid.UUID
-        self.field_memory = {}
-        self.children = {}
+        # shared-data bookkeeping
+        self.data = {}              # field_name -> ptr (UUID)
+        self.field_memory = {}      # field_name -> size
+        self.field_index = {}       # field_name -> index in fields_id
+        self.children = {}          # child_name -> Node
+
+        # identity / bookkeeping
         self.id = uuid.uuid4()
         self.fields_count = 0
+        self.memory_usage = 0
+        self.total_memory_usage = 0
+        self.last_gc_check = 0
 
+        # uuid buffer etc (unchanged)
+        self._fields_id_buf = bytearray(self.max_fields * 16)
+        self.fields_id = memoryview(self._fields_id_buf)
+
+        # memray placeholders
         self._memray_tracker = None
         self._memray_report_path = None
 
-        # cache (in-process) for deserialized values + their digest timestamp
-        super().__setattr__("_cache", {})
-        super().__setattr__("_cache_version", {})
+        # caches for lazy loading
+        if '_cache' not in self.__dict__:
+            super().__setattr__('_cache', {})
+        if '_cache_digest' not in self.__dict__:
+            super().__setattr__('_cache_digest', {})
 
-        # attach incoming refs (child process): inc_ref to claim
+        self.logger.info(f"[INIT] Node {self.id} created with heap memory model")
+        self.update_memory_usage()
+
         if data_refs:
-            for name, us in data_refs.items():
-                u = uuid.UUID(us)
-                self.data[name] = u
-                try:
-                    self.heap.inc_ref(u)
-                except Exception:
-                    pass
+            # attach pointers provided by parent process
+            self.data = {k: uuid.UUID(v) for k, v in data_refs.items()}
 
     @property
     def data_refs(self):
         return {k: str(v) for k, v in self.data.items()}
 
+    # centralized reserved-name test (prevents accidental shadowing)
+    def _is_reserved_attr(self, name):
+        # include internal attributes and all public methods that must not be shadowed
+        reserved = {
+            # internal bookkeeping
+            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
+            'field_index', 'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage',
+            'last_gc_check', 'logger', '_memray_tracker', '_memray_report_path',
+            '_fields_id_buf', 'fields_id', 'heap', '_cache', '_cache_digest',
+
+            # Node public methods that must not be shadowed by fields
+            'add_field', 'set_field_value', 'get_field_value', 'remove_field',
+            'get_memory_report', 'get_total_memory_usage',
+            'start_memray_tracking', 'stop_memray_tracking', 'print_memray_report',
+            'export_shared_refs', 'attach_shared_refs', 'cleanup_unused_memory',
+            # dunder & others
+            '__repr__', '__getattr__', '__setattr__', '__init__', 'data_refs',
+        }
+        if name.startswith('_'):
+            return True
+        return name in reserved
+
+    # ---------- Dot notation read (with cache + change detection) ----------
     def __getattr__(self, name):
-        # provide dot-style access
+        # reserved/internal names should be handled by normal attribute lookup
+        if self._is_reserved_attr(name):
+            return super().__getattribute__(name)
+
+        # ensure field exists
         if name not in self.data:
             self.add_field(name, None)
-            return None
 
         ptr = self.data[name]
+
+        # cache access
+        cache = super().__getattribute__('_cache')
+        cache_digest = super().__getattribute__('_cache_digest')
+
+        # get backing shared memory info from heap mapping
         key = str(ptr)
+        shm_info = self.heap._shm_map.get(key)
+        if shm_info is None:
+            # pointer present but heap mapping missing -> safe fallback
+            val = self.heap.read(ptr)
+            cache[name] = val
+            cache_digest[name] = None
+            return val
 
-        # read version + event to decide whether to use cache
-        with self.heap._lock():
-            ver = self.heap._version_map.get(key)
-            ev = self.heap._event_map.get(key)
+        # heap._shm_map may store either a name or (name, slab_size)
+        if isinstance(shm_info, tuple):
+            shm_name = shm_info[0]
+        else:
+            shm_name = shm_info
 
-        # if write-in-progress wait a short time
-        if ev:
-            try:
-                if hasattr(ev, "is_set"):
-                    # wait until cleared
-                    start = time.time()
-                    while ev.is_set() and time.time() - start < 0.5:
-                        time.sleep(0.01)
-                else:
-                    # boolean flag - busy wait
-                    start = time.time()
-                    while self.heap._event_map.get(key) and time.time() - start < 0.5:
-                        time.sleep(0.01)
-            except Exception:
-                pass
+        size = self.heap._size_map.get(key)
+        if size is None:
+            # fallback: use heap.read
+            val = self.heap.read(ptr)
+            cache[name] = val
+            cache_digest[name] = None
+            return val
 
-        # if cached and version matches, return cache
-        cache = super().__getattribute__("_cache")
-        cache_ver = super().__getattribute__("_cache_version")
-        if name in cache and cache_ver.get(name) == ver:
+        # read raw bytes and compute digest to detect external modification
+        shm = shared_memory.SharedMemory(name=shm_name)
+        try:
+            buf = bytes(shm.buf[:size])
+        finally:
+            shm.close()
+
+        digest = hash(buf)
+
+        if name in cache and cache_digest.get(name) == digest:
             return cache[name]
 
-        # else read from heap and update cache
-        val = self.heap.read(ptr)
+        # deserialize and update caches
+        val = self.heap._deserialize(buf)
         cache[name] = val
-        cache_ver[name] = ver
+        cache_digest[name] = digest
         return val
 
+    # ---------- Dot notation write ----------
     def __setattr__(self, name, value):
-        reserved = {
-            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
-            'children', 'id', 'memory_usage', 'total_memory_usage', 'logger',
-            '_memray_tracker', '_memray_report_path', 'heap', '_cache', '_cache_digest',
-            'fields_count', '_write_lock', '_version', '_gc_thread', '_stop_gc'
-        }
-        if name in reserved or name.startswith('_'):
-            super().__setattr__(name, value)
-            return
-        # update or create
+        if self._is_reserved_attr(name):
+            return super().__setattr__(name, value)
+
+        # route through shared memory
         if name in self.data:
-            ptr = self.data[name]
-            # write with transactional semantics
-            self.heap.write(ptr, value)
-            # update cache version (read new version)
-            with self.heap._lock():
-                ver = self.heap._version_map.get(str(ptr))
-            self._cache[name] = value
-            self._cache_version[name] = ver
-            self.field_memory[name] = self._get_object_size(value)
+            self.set_field_value(name, value)
         else:
-            ptr = self.heap.alloc(value)
-            self.data[name] = ptr
-            self.field_memory[name] = self._get_object_size(value)
-            self.fields_count = len(self.data)
+            self.add_field(name, value)
 
-    def remove_field(self, name):
-        if name not in self.data:
-            return
-        ptr = self.data.pop(name)
-        self.field_memory.pop(name, None)
+        # invalidate cache for that field
+        if '_cache' in self.__dict__:
+            self._cache.pop(name, None)
+            self._cache_digest.pop(name, None)
+
+    # ---------- core field operations ----------
+    def add_field(self, field_name, value):
+        if field_name in self.data:
+            return self.set_field_value(field_name, value)
+        ptr = self.heap.alloc(value)
+        self.data[field_name] = ptr
+        self.field_memory[field_name] = self._get_object_size(value)
+        self.field_index[field_name] = len(self.field_index)
         self.fields_count = len(self.data)
-        try:
-            # decrement refcount so GC can free if 0
-            self.heap.dec_ref(ptr)
-        except Exception:
-            try:
-                self.heap.free(ptr)
-            except Exception:
-                pass
+        self.update_memory_usage()
 
+    def set_field_value(self, field_name, value):
+        if field_name not in self.data:
+            return self.add_field(field_name, value)
+        ptr = self.data[field_name]
+        self.heap.write(ptr, value)
+        self.field_memory[field_name] = self._get_object_size(value)
+        self.update_memory_usage()
+
+    def get_field_value(self, field_name):
+        ptr = self.data.get(field_name)
+        return self.heap.read(ptr) if ptr else None
+
+    def remove_field(self, field_name):
+        """Remove a field: free its shared memory and drop bookkeeping entries."""
+        if field_name not in self.data:
+            return
+        ptr = self.data.pop(field_name)
+        # free from heap (will unlink or add to pool based on your Heap implementation)
+        try:
+            self.heap.free(ptr)
+        except Exception as e:
+            # log but continue cleanup of local state
+            self.logger.warning(f"[REMOVE] heap.free failed for {ptr}: {e}")
+        # remove bookkeeping
+        self.field_memory.pop(field_name, None)
+        self.field_index.pop(field_name, None)
+        # clear caches
+        if '_cache' in self.__dict__:
+            self._cache.pop(field_name, None)
+            self._cache_digest.pop(field_name, None)
+        self.fields_count = len(self.data)
+        self.update_memory_usage()
+
+    # ---------- remaining helpers / memray etc. (unchanged) ----------
     def _create_default_logger(self):
         logger = logging.getLogger(f"Node-{id(self)}")
         if not logger.handlers:
             handler = logging.StreamHandler()
-            fmt = logging.Formatter("%(asctime)s | %(levelname)-6s | %(name)s | %(message)s", "%H:%M:%S")
-            handler.setFormatter(fmt)
+            formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", "%H:%M:%S")
+            handler.setFormatter(formatter)
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
         return logger
 
     def _get_object_size(self, obj):
-        # approximate
         size = sys.getsizeof(obj)
         if isinstance(obj, (list, dict, set, tuple)):
-            for i in obj:
-                size += self._get_object_size(i)
+            size += sum(self._get_object_size(i) for i in obj)
         elif isinstance(obj, str):
             size += len(obj.encode('utf-8'))
         elif isinstance(obj, Node):
             size += obj.get_total_memory_usage()
         return size
 
-    def get_field_value(self, field_name):
-        return getattr(self, field_name)
-
-    def set_field_value(self, field_name, value):
-        setattr(self, field_name, value)
-
-    # memray helpers kept
-    def start_memray_tracking(self, path="memray_trace.bin"):
-        if not memray:
-            self.logger.warning("memray not installed")
-            return
-        self._memray_report_path = path
-        self._memray_tracker = memray.Tracker(path)
-        self._memray_tracker.__enter__()
-
-    def stop_memray_tracking(self):
-        if not self._memray_tracker:
-            return
-        self._memray_tracker.__exit__(None, None, None)
-        self._memray_tracker = None
-
-    def print_memray_report(self, html_path=None):
-        if not self._memray_report_path or not os.path.exists(self._memray_report_path):
-            self.logger.warning("No memray report file")
-            return
-        html_path = html_path or (self._memray_report_path + ".html")
-        os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
+    def update_memory_usage(self):
+        self.memory_usage = sum(self.field_memory.values())
+        self.total_memory_usage = self.memory_usage + sum(c.get_total_memory_usage() for c in self.children.values())
+        if self.memory_limit and self.total_memory_usage > self.memory_limit * self.warn_threshold:
+            self.logger.warning(f"[WARN] Node {self.id} memory {self.total_memory_usage}/{self.memory_limit} bytes")
 
     def get_memory_report(self, deep=False):
         report = {
             "node_id": str(self.id),
-            "fields": {k: {"size_bytes": v, "ptr": str(self.data[k])} for k, v in self.field_memory.items()},
+            "fields": {
+                k: {
+                    "size_bytes": v,
+                    "ptr": str(self.data[k]),
+                    "index": self.field_index.get(k)
+                } for k, v in self.field_memory.items()
+            },
             "total": f"{self.total_memory_usage} bytes"
         }
         if deep and self.children:
@@ -509,50 +591,60 @@ class Node:
         self.update_memory_usage()
         return self.total_memory_usage
 
-    def update_memory_usage(self):
-        self.memory_usage = sum(self.field_memory.values())
-        self.total_memory_usage = self.memory_usage + sum(c.get_total_memory_usage() for c in self.children.values())
-        if self.memory_limit and self.total_memory_usage > self.memory_limit * self.warn_threshold:
-            self.logger.warning("[Node] memory high")
+    def start_memray_tracking(self, path="memray_trace.bin"):
+        if not memray:
+            self.logger.warning("Memray not installed")
+            return
+        self._memray_report_path = path
+        self._memray_tracker = memray.Tracker(path)
+        self._memray_tracker.__enter__()
+        self.logger.info(f"[MEMRAY] Started tracking → {path}")
+
+    def stop_memray_tracking(self):
+        if not self._memray_tracker:
+            return
+        self._memray_tracker.__exit__(None, None, None)
+        self.logger.info(f"[MEMRAY] Stopped tracking ({self._memray_report_path})")
+        self._memray_tracker = None
+
+    def print_memray_report(self, html_path=None):
+        if not memray:
+            self.logger.warning("Memray not installed")
+            return
+        if not self._memray_report_path or not os.path.exists(self._memray_report_path):
+            self.logger.warning("No Memray report file found")
+            return
+        html_path = html_path or (self._memray_report_path + ".html")
+        os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
+        self.logger.info(f"[MEMRAY] HTML report generated → {html_path}")
+
+    def __repr__(self):
+        return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
+
 
 
 if __name__ == "__main__":
 
-    def child_proc(shared_maps, data_refs):
-        node = Node(shared_maps=shared_maps, data_refs=data_refs)
-        print("[child] before:", node.field_str)
-        node.field_str = "Modified by child"
-        print("[child] after:", node.field_str)
-        # release local claim
-        node.remove_field("field_str")
-
-    mgr = Manager()
-    shm_map = mgr.dict()
-    size_map = mgr.dict()
-    version_map = mgr.dict()
-    refcount_map = mgr.dict()
-    lock = mgr.Lock()
-    event_map = mgr.dict()   # will hold manager.Event proxies or booleans
-
-    shared_maps = (shm_map, size_map, version_map, refcount_map, lock, event_map)
+    manager = Manager()
+    shared_maps = (manager.dict(), manager.dict())
 
     node = Node(shared_maps=shared_maps)
-    node.field_str = "Hello from parent"
+    node.field_str = "Hello, world!"
     print("[parent] before child:", node.field_str)
 
-    # prepare data_refs and launch child
-    refs = node.data_refs
-    p = Process(target=child_proc, args=(shared_maps, refs))
+    def child_proc(shared_maps, data_refs):
+        node_c = Node(shared_maps=shared_maps, data_refs=data_refs)
+        print("[child] before:", node_c.field_str)
+        node_c.field_str = "Modified by child"
+        print("[child] after:", node_c.field_str)
+
+    p = Process(target=child_proc, args=(shared_maps, node.data_refs))
     p.start()
     p.join()
 
-    # small delay to let manager sync
-    time.sleep(0.1)
     print("[parent] after child:", node.field_str)
-    print(node.get_memory_report())
-
-    # cleanup all
+    # remove in parent
     node.remove_field("field_str")
-    node.heap._cleanup_all()
+    print("removed. present?", "field_str" in node.data)
 
     
