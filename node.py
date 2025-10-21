@@ -7,7 +7,7 @@ import logging
 import os
 import pickle
 import threading
-from multiprocessing import shared_memory
+from multiprocessing import shared_memory, Manager, Process
 
 try:
     import memray
@@ -15,18 +15,21 @@ except ImportError:
     memray = None
 
 
-
-
-# ---------- Менеджер памяти с настоящей shared memory ----------
+# ---------- Shared-memory-aware MemoryHeap ----------
 class _MemoryHeap:
     """
     Менеджер памяти, хранящий объекты по UUID-указателям
     в сегментах настоящей shared memory, доступных из разных процессов.
     """
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, shared_maps=None):
         self.lock = threading.Lock()
-        self._shm_map = {}   # uuid -> SharedMemory name
-        self._size_map = {}  # uuid -> размер
+
+        # Shared dicts (for multi-process)
+        if shared_maps:
+            self._shm_map, self._size_map = shared_maps
+        else:
+            self._shm_map, self._size_map = {}, {}
+
         self.logger = logger or self._create_default_logger()
 
     def _create_default_logger(self):
@@ -46,9 +49,7 @@ class _MemoryHeap:
         return pickle.loads(buf)
 
     def alloc(self, obj):
-        """
-        Сохраняет объект в shared memory и возвращает uuid-указатель.
-        """
+        """Сохраняет объект в shared memory и возвращает uuid-указатель."""
         u = uuid.uuid4()
         data = self._serialize(obj)
         size = len(data)
@@ -56,57 +57,54 @@ class _MemoryHeap:
         shm.buf[:size] = data
 
         with self.lock:
-            self._shm_map[u] = shm.name
-            self._size_map[u] = size
+            self._shm_map[str(u)] = shm.name
+            self._size_map[str(u)] = size
 
+        shm.close()
         self.logger.debug(f"[HEAP] Allocated {u} → {type(obj).__name__} ({size} bytes)")
         return u
 
     def read(self, ptr):
-        """
-        Получает объект по UUID из shared memory.
-        """
+        """Получает объект по UUID из shared memory."""
+        key = str(ptr)
         with self.lock:
-            shm_name = self._shm_map.get(ptr)
-            size = self._size_map.get(ptr)
+            shm_name = self._shm_map.get(key)
+            size = self._size_map.get(key)
             if shm_name is None:
-                return None
+                raise KeyError(f"Invalid memory pointer: {ptr}")
         shm = shared_memory.SharedMemory(name=shm_name)
         buf = bytes(shm.buf[:size])
         obj = self._deserialize(buf)
-        shm.close()  # не удаляем память, т.к. объект может использоваться в других процессах
+        shm.close()
         return obj
 
     def write(self, ptr, value):
-        """
-        Перезаписывает объект по UUID в shared memory.
-        """
+        """Перезаписывает объект по UUID в shared memory."""
+        key = str(ptr)
         with self.lock:
-            shm_name = self._shm_map.get(ptr)
+            shm_name = self._shm_map.get(key)
             if shm_name is None:
                 raise KeyError(f"Invalid memory pointer: {ptr}")
         data = self._serialize(value)
         size = len(data)
         shm = shared_memory.SharedMemory(name=shm_name)
         if size > shm.size:
-            # объект больше текущего сегмента — пересоздаем shared memory
             shm.close()
             shm.unlink()
             shm = shared_memory.SharedMemory(create=True, size=size)
             with self.lock:
-                self._shm_map[ptr] = shm.name
-                self._size_map[ptr] = size
+                self._shm_map[key] = shm.name
+                self._size_map[key] = size
         shm.buf[:size] = data
         shm.close()
         self.logger.debug(f"[HEAP] Updated {ptr} → {type(value).__name__} ({size} bytes)")
 
     def free(self, ptr):
-        """
-        Освобождает сегмент shared memory.
-        """
+        """Освобождает сегмент shared memory."""
+        key = str(ptr)
         with self.lock:
-            shm_name = self._shm_map.pop(ptr, None)
-            self._size_map.pop(ptr, None)
+            shm_name = self._shm_map.pop(key, None)
+            self._size_map.pop(key, None)
         if shm_name:
             shm = shared_memory.SharedMemory(name=shm_name)
             shm.close()
@@ -114,27 +112,22 @@ class _MemoryHeap:
             self.logger.debug(f"[HEAP] Freed memory at {ptr}")
 
     def cleanup(self, active_pointers):
-        """
-        Удаляет все объекты, которых нет в active_pointers.
-        """
-        for ptr in list(self._shm_map.keys()):
-            if ptr not in active_pointers:
-                self.logger.debug(f"[HEAP] Auto-free unused pointer {ptr}")
-                self.free(ptr)
+        """Удаляет все объекты, которых нет в active_pointers."""
+        for key in list(self._shm_map.keys()):
+            if key not in map(str, active_pointers):
+                self.free(uuid.UUID(key))
 
     def used(self):
-        """
-        Список всех активных UUID.
-        """
+        """Список всех активных UUID."""
         with self.lock:
             return list(self._shm_map.keys())
 
 
 # ---------- Node ----------
 class Node:
-    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None):
+    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None, shared_maps=None):
         self.logger = logger or self._create_default_logger()
-        self.heap = _MemoryHeap(self.logger)
+        self.heap = _MemoryHeap(self.logger, shared_maps=shared_maps)
 
         self.max_fields = max_fields
         self.memory_limit = memory_limit
@@ -162,7 +155,6 @@ class Node:
 
     # ---------- Dot notation ----------
     def __getattr__(self, name):
-        # если нет системного атрибута, создаём поле автоматически
         if name not in self.data:
             self.add_field(name, None)
         return self.get_field_value(name)
@@ -207,127 +199,29 @@ class Node:
         if self.memory_limit and self.total_memory_usage > self.memory_limit * self.warn_threshold:
             self.logger.warning(f"[WARN] Node {self.id} memory {self.total_memory_usage}/{self.memory_limit} bytes")
 
-    # ---------- UUID буфер ----------
-    def _ensure_fields_capacity(self, required):
-        if required <= self.max_fields:
-            return
-        new_max = max(required, self.max_fields * 2)
-        new_buf = bytearray(new_max * 16)
-        new_buf[:len(self._fields_id_buf)] = self._fields_id_buf
-        self._fields_id_buf = new_buf
-        self.fields_id = memoryview(self._fields_id_buf)
-        self.logger.info(f"[UUID] Expanded fields_id capacity from {self.max_fields} to {new_max}")
-        self.max_fields = new_max
-
-    def _write_uuid_at_index(self, index, ubytes):
-        self.fields_id[index * 16:index * 16 + 16] = ubytes
-
-    def _clear_uuid_at_index(self, index):
-        self.fields_id[index * 16:index * 16 + 16] = b'\x00' * 16
-
-    def _read_uuid_at_index(self, index):
-        start = index * 16
-        end = start + 16
-        return bytes(self.fields_id[start:end])
-
     # ---------- Управление полями ----------
     def add_field(self, field_name, value):
         if field_name in self.data:
             return self.set_field_value(field_name, value)
 
-        required = self.fields_count + 1
-        if required > self.max_fields:
-            self._ensure_fields_capacity(required)
-
-        idx = self.fields_count
-        for i in range(self.max_fields):
-            if self._read_uuid_at_index(i) == b'\x00' * 16:
-                idx = i
-                break
-
         ptr = self.heap.alloc(value)
         self.data[field_name] = ptr
-        self.field_index[field_name] = idx
-        self._write_uuid_at_index(idx, ptr.bytes)
-
-        size = self._get_object_size(value)
-        self.field_memory[field_name] = size
+        self.field_memory[field_name] = self._get_object_size(value)
+        self.field_index[field_name] = len(self.field_index)
         self.fields_count = len(self.data)
-
-        self.logger.info(f"[ADD] Field '{field_name}' at {self.id} ptr={ptr} size={size}")
         self.update_memory_usage()
-
-        now = time.time()
-        if now - self.last_gc_check > 10:
-            collected = gc.collect()
-            self.logger.debug(f"[GC] Freed {collected} objects")
-            self.last_gc_check = now
-            self.update_memory_usage()
 
     def set_field_value(self, field_name, value):
         if field_name not in self.data:
             return self.add_field(field_name, value)
         ptr = self.data[field_name]
         self.heap.write(ptr, value)
-        size = self._get_object_size(value)
-        self.field_memory[field_name] = size
-        self.logger.info(f"[UPDATE] Field '{field_name}' updated (size={size})")
+        self.field_memory[field_name] = self._get_object_size(value)
         self.update_memory_usage()
 
     def get_field_value(self, field_name):
         ptr = self.data.get(field_name)
         return self.heap.read(ptr) if ptr else None
-
-    def remove_field(self, field_name):
-        if field_name not in self.data:
-            return
-        ptr = self.data.pop(field_name)
-        idx = self.field_index.pop(field_name, None)
-        self.heap.free(ptr)
-        if idx is not None:
-            self._clear_uuid_at_index(idx)
-        self.field_memory.pop(field_name, None)
-        self.logger.info(f"[REMOVE] Field '{field_name}' freed ({ptr})")
-        self.fields_count = len(self.data)
-        self.update_memory_usage()
-
-    # ---------- Работа с детьми ----------
-    def add_child(self, name, node):
-        if not isinstance(node, Node):
-            raise TypeError("child must be Node")
-        self.children[name] = node
-        self.logger.info(f"[CHILD] Node {node.id} added as child '{name}'")
-        self.update_memory_usage()
-
-    # ---------- Поиск по UUID ----------
-    def find_field_by_uuid(self, u):
-        if isinstance(u, uuid.UUID):
-            target = u.bytes
-        elif isinstance(u, (bytes, bytearray)):
-            if len(u) != 16:
-                raise ValueError("UUID must be 16 bytes")
-            target = bytes(u)
-        else:
-            target = uuid.UUID(str(u)).bytes
-
-        for fname, idx in self.field_index.items():
-            if self._read_uuid_at_index(idx) == target:
-                return self, fname
-
-        for child in self.children.values():
-            res = child.find_field_by_uuid(target)
-            if res:
-                return res
-        return None
-
-    # ---------- Сборка мусора ----------
-    def cleanup_unused_memory(self):
-        active = set(self.data.values())
-        for child in self.children.values():
-            active |= set(child.data.values())
-        self.heap.cleanup(active)
-        gc.collect()
-        self.logger.info(f"[GC] Cleanup done, {len(self.heap.heap)} active objects remain")
 
     # ---------- Memray ----------
     def start_memray_tracking(self, path="memray_trace.bin"):
@@ -357,7 +251,6 @@ class Node:
         os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
         self.logger.info(f"[MEMRAY] HTML report generated → {html_path}")
 
-    # ---------- Отчёты ----------
     def get_memory_report(self, deep=False):
         report = {
             "node_id": str(self.id),
@@ -378,30 +271,44 @@ class Node:
         self.update_memory_usage()
         return self.total_memory_usage
 
-    def __repr__(self):
-        return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
+
+# ---------- Example: Multi-process test ----------
+def child(shared_maps, data_refs):
+    node = Node(shared_maps=shared_maps)
+    print("\n[Child] Reading shared data:")
+    for name, uid in data_refs.items():
+        val = node.heap.read(uuid.UUID(uid))
+        print(f"[Child] {name}: {val}")
+        if name == "field_str":
+            node.heap.write(uuid.UUID(uid), "Modified by child!")
 
 
-# пример использования
+if __name__ == "__main__":
+    manager = Manager()
+    shared_maps = (manager.dict(), manager.dict())
 
-node = Node(memory_limit=3_000)
+    node = Node(memory_limit=3_000, shared_maps=shared_maps)
+    node.start_memray_tracking("test_memray.bin")
 
-node.start_memray_tracking("test_memray.bin")
+    node.big_list = [x for x in range(3000)]
+    node.field_int = 42
+    node.field_str = "Hello, world!"
+    node.field_list = [1, 2, 3, 4, 5]
+    node.field_dict = {'a': 1, 'b': 2}
+    node.field_set = {10, 20, 30}
+    node.field_tuple = (1, 2, 3)
 
-# создаём нагрузку
-node.big_list = [x for x in range(3000)]
-node.field_int = 42  # Целое число
-node.field_str = "Hello, world!"  # Строка
-node.field_list = [1, 2, 3, 4, 5]  # Список
-node.field_dict = {'a': 1, 'b': 2}  # Словарь
-node.field_set = {10, 20, 30}  # Множество
-node.field_tuple = (1, 2, 3)  # Кортеж
+    node.stop_memray_tracking()
+    node.print_memray_report("test_report.html")
 
-node.stop_memray_tracking()
-node.print_memray_report("test_report.html")
+    # Access same shared memory from child process
+    data_refs = {k: str(v) for k, v in node.data.items()}
+    p = Process(target=child, args=(shared_maps, data_refs))
+    p.start()
+    p.join()
 
-# Проверим, сколько памяти занимает структура
-print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
+    print("\n[Parent] After child modification:")
+    for k, v in data_refs.items():
+        print(f"  {k} = {node.heap.read(uuid.UUID(v))}")
 
-# Печатаем структуру данных с детализацией памяти
-print(node.get_memory_report())
+    print("\n[MEMORY REPORT]", node.get_memory_report())
