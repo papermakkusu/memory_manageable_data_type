@@ -177,7 +177,10 @@ class Node:
 
         if data_refs:
             self.data = {k: uuid.UUID(v) for k, v in data_refs.items()}
-        
+
+    @property
+    def data_refs(self):
+        return {k: str(v) for k, v in self.data.items()}
 
     # ---------- Dot notation ----------
     def __getattr__(self, name):
@@ -303,34 +306,24 @@ if __name__ == "__main__":
     # ---------- Example: Multi-process test ----------
     def child(shared_maps, data_refs):
         node = Node(shared_maps=shared_maps, data_refs=data_refs)
-        print("\n[Child] Reading shared data:")
+        print("\n[Child] Modifying shared data...")
         node.field_str = "Modified by child!"
 
     manager = Manager()
     shared_maps = (manager.dict(), manager.dict())
 
     node = Node(memory_limit=300, shared_maps=shared_maps)
-    node.start_memray_tracking("test_memray.bin")
-
-    node.big_list = [x for x in range(100)]
-    node.field_int = 42
     node.field_str = "Hello, world!"
-    node.field_list = [1, 2, 3, 4, 5]
-    node.field_dict = {'a': 1, 'b': 2}
-    node.field_set = {10, 20, 30}
-    node.field_tuple = (1, 2, 3)
 
-    node.stop_memray_tracking()
-    node.print_memray_report("test_report.html")
+    print("\n[Parent] Before child modification:")
+    print(node.field_str)
 
     # Access same shared memory from child process
-    data_refs = {k: str(v) for k, v in node.data.items()}
-    p = Process(target=child, args=(shared_maps, data_refs))
+    p = Process(target=child, args=(shared_maps, node.data_refs))
     p.start()
     p.join()
 
     print("\n[Parent] After child modification:")
-    for k, v in data_refs.items():
-        print(f"  {k} = {node.heap.read(uuid.UUID(v))}")
+    print(node.field_str)
 
     print("\n[MEMORY REPORT]", node.get_memory_report())
