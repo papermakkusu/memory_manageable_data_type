@@ -8,6 +8,7 @@ import os
 import pickle
 import threading
 from multiprocessing import shared_memory, Manager, Process
+import atexit  # <-- added
 
 try:
     import memray
@@ -31,6 +32,9 @@ class _MemoryHeap:
             self._shm_map, self._size_map = {}, {}
 
         self.logger = logger or self._create_default_logger()
+
+        # --- Cleanup all shared memory on process exit ---
+        atexit.register(self._cleanup_all)
 
     def _create_default_logger(self):
         logger = logging.getLogger("MemoryHeap")
@@ -106,10 +110,13 @@ class _MemoryHeap:
             shm_name = self._shm_map.pop(key, None)
             self._size_map.pop(key, None)
         if shm_name:
-            shm = shared_memory.SharedMemory(name=shm_name)
-            shm.close()
-            shm.unlink()
-            self.logger.debug(f"[HEAP] Freed memory at {ptr}")
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shm.close()
+                shm.unlink()
+                self.logger.debug(f"[HEAP] Freed memory at {ptr}")
+            except FileNotFoundError:
+                pass
 
     def cleanup(self, active_pointers):
         """Удаляет все объекты, которых нет в active_pointers."""
@@ -122,10 +129,25 @@ class _MemoryHeap:
         with self.lock:
             return list(self._shm_map.keys())
 
+    # ---------- Cleanup all shared memory at process exit ----------
+    def _cleanup_all(self):
+        with self.lock:
+            for key, shm_name in list(self._shm_map.items()):
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shm.close()
+                    shm.unlink()
+                    self.logger.debug(f"[HEAP] Auto-freed shared memory {key}")
+                except FileNotFoundError:
+                    pass
+            self._shm_map.clear()
+            self._size_map.clear()
+        self.logger.info("[HEAP] Cleaned up all shared memory")
+
 
 # ---------- Node ----------
 class Node:
-    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None, shared_maps=None):
+    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None, shared_maps=None, data_refs=None):
         self.logger = logger or self._create_default_logger()
         self.heap = _MemoryHeap(self.logger, shared_maps=shared_maps)
 
@@ -152,6 +174,10 @@ class Node:
 
         self.logger.info(f"[INIT] Node {self.id} created with heap memory model")
         self.update_memory_usage()
+
+        if data_refs:
+            self.data = {k: uuid.UUID(v) for k, v in data_refs.items()}
+        
 
     # ---------- Dot notation ----------
     def __getattr__(self, name):
@@ -272,25 +298,21 @@ class Node:
         return self.total_memory_usage
 
 
-# ---------- Example: Multi-process test ----------
-def child(shared_maps, data_refs):
-    node = Node(shared_maps=shared_maps)
-    print("\n[Child] Reading shared data:")
-    for name, uid in data_refs.items():
-        val = node.heap.read(uuid.UUID(uid))
-        print(f"[Child] {name}: {val}")
-        if name == "field_str":
-            node.heap.write(uuid.UUID(uid), "Modified by child!")
-
-
 if __name__ == "__main__":
+
+    # ---------- Example: Multi-process test ----------
+    def child(shared_maps, data_refs):
+        node = Node(shared_maps=shared_maps, data_refs=data_refs)
+        print("\n[Child] Reading shared data:")
+        node.field_str = "Modified by child!"
+
     manager = Manager()
     shared_maps = (manager.dict(), manager.dict())
 
-    node = Node(memory_limit=3_000, shared_maps=shared_maps)
+    node = Node(memory_limit=300, shared_maps=shared_maps)
     node.start_memray_tracking("test_memray.bin")
 
-    node.big_list = [x for x in range(3000)]
+    node.big_list = [x for x in range(100)]
     node.field_int = 42
     node.field_str = "Hello, world!"
     node.field_list = [1, 2, 3, 4, 5]
