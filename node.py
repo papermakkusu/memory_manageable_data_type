@@ -200,6 +200,8 @@ class Node:
     def __repr__(self):
         return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
 
+# пример использования
+
 node = Node(memory_limit=5_000_000)
 
 node.start_memray_tracking("test_memray.bin")
@@ -214,15 +216,13 @@ print(node.get_memory_report())
 print()
 print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
 
-# Добавляем поля различных типов, включая функции
+# Добавляем поля различных типов
 node.field_int = 42  # Целое число
 node.field_str = "Hello, world!"  # Строка
 node.field_list = [1, 2, 3, 4, 5]  # Список
 node.field_dict = {'a': 1, 'b': 2}  # Словарь
 node.field_set = {10, 20, 30}  # Множество
 node.field_tuple = (1, 2, 3)  # Кортеж
-node.field_greet = greet  # Функ
-node.field_greet()
 
 # Проверим, сколько памяти занимает структура
 print(f"Total memory usage for root: {node.get_total_memory_usage()} bytes")
