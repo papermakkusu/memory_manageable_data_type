@@ -1,139 +1,135 @@
 import uuid
 import sys
-import array
 import types
-
+import weakref
+import gc
+import time
 
 
 class Node:
-    def __init__(self, max_fields=10, memory_limit=None):
+    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8):
         """
-        Конструктор для создания узла данных.
+        Node: узел данных с контролем памяти и возможностью вложенности.
         max_fields — максимальное количество полей в узле.
-        memory_limit — лимит на потребляемую память в байтах.
+        memory_limit — лимит памяти для всего дерева, байт.
+        warn_threshold — доля лимита памяти (0..1), при которой выводится предупреждение.
         """
-        self.max_fields = max_fields  # Максимальное количество полей
-        self.memory_limit = memory_limit  # Лимит памяти
-        self.data = {}  # Словарь для хранения полей с данными
-        self.fields_id = memoryview(bytearray(max_fields * 16))  # memoryview для хранения ID полей (16 байт на ID)
-        self.fields_count = 0  # Количество текущих полей
-        self.children = {}  # Словарь для хранения дочерних узлов
-        self.id = uuid.uuid4()  # Уникальный ID для узла
-        self.memory_usage = 0  # Память, используемая узлом
-        self.total_memory_usage = 0  # Общий размер памяти всех данных в дереве
+        self.max_fields = max_fields
+        self.memory_limit = memory_limit
+        self.warn_threshold = warn_threshold
+        self.data = {}
+        self.field_memory = {}  # учёт памяти по каждому полю
+        self.fields_count = 0
+        self.children = {}
+        self.id = uuid.uuid4()
+        self.memory_usage = 0
+        self.total_memory_usage = 0
+        self.last_gc_check = 0
         self.update_memory_usage()
 
+    # --- Механика доступа к полям ---
     def __getattr__(self, name):
-        """Перехват доступа к полям через точечную нотацию."""
-        # Если поле не существует, создаем его и возвращаем значение
         if name not in self.data:
-            # Для новых полей добавляем пустое значение, которое можно будет затем изменить
             self.add_field(name, None)
         return self.data[name]
 
     def __setattr__(self, name, value):
-        """Перехват записи в поля через точечную нотацию."""
-        if name in ['max_fields', 'memory_limit', 'data', 'fields_id', 'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage']:
-            # Для зарезервированных атрибутов просто устанавливаем значения
+        if name in {'max_fields', 'memory_limit', 'warn_threshold', 'data',
+                    'field_memory', 'fields_count', 'children', 'id',
+                    'memory_usage', 'total_memory_usage', 'last_gc_check'}:
             super().__setattr__(name, value)
         else:
-            # Добавляем или обновляем поле через метод add_field
             self.add_field(name, value)
 
-    def update_memory_usage(self):
-        """Обновление памяти для узла и всех дочерних данных."""
-        self.memory_usage = sum(self._get_object_size(value) for value in self.data.values())
-        self.total_memory_usage = self.memory_usage
-        for child in self.children.values():
-            self.total_memory_usage += child.total_memory_usage  # Суммируем память от дочерних узлов
-
-        # Если превышен лимит памяти, выводим предупреждение и увеличиваем лимит
-        if self.memory_limit and self.total_memory_usage > self.memory_limit:
-            self.raise_memory_limit_warning()
-
+    # --- Управление памятью ---
     def _get_object_size(self, obj):
-        """Рекурсивное вычисление размера объекта (включая вложенные элементы для динамических типов)."""
-        size = sys.getsizeof(obj)  # Основной размер объекта
+        """Рекурсивная оценка размера объекта, включая вложенные элементы."""
+        size = sys.getsizeof(obj)
         if isinstance(obj, (list, dict, set, tuple)):
-            # Для коллекций учитываем их содержимое
             size += sum(self._get_object_size(item) for item in obj)
         elif isinstance(obj, str):
-            # Для строк также учитываем их содержимое
-            size += sys.getsizeof(obj)  # Включая строковые символы
+            size += len(obj.encode('utf-8'))
         elif isinstance(obj, types.FunctionType):
-            # Для функции учитываем её размер
-            size += sys.getsizeof(obj.__code__)  # Добавляем размер кода функции
-            size += sys.getsizeof(obj.__defaults__)  # Размер аргументов по умолчанию
-            size += sys.getsizeof(obj.__closure__)  # Размер замкнутых переменных (если есть)
+            size += sys.getsizeof(obj.__code__) + sys.getsizeof(obj.__defaults__) + sys.getsizeof(obj.__closure__)
+        elif isinstance(obj, Node):
+            size += obj.get_total_memory_usage()
         return size
 
+    def update_memory_usage(self):
+        """Обновляет использование памяти и выполняет контроль порогов."""
+        self.memory_usage = sum(self.field_memory.values())
+        self.total_memory_usage = self.memory_usage + sum(child.get_total_memory_usage() for child in self.children.values())
+
+        if self.memory_limit:
+            if self.total_memory_usage > self.memory_limit:
+                self._raise_memory_limit_warning()
+            elif self.total_memory_usage > self.memory_limit * self.warn_threshold:
+                print(f"[⚠️ WARNING] Memory usage at {self.total_memory_usage} / {self.memory_limit} bytes "
+                      f"({(self.total_memory_usage / self.memory_limit) * 100:.1f}%)")
+
+    def _raise_memory_limit_warning(self):
+        """Реакция на превышение лимита памяти."""
+        diff = self.total_memory_usage - self.memory_limit
+        print(f"[🚨 CRITICAL] Memory limit exceeded! "
+              f"Limit={self.memory_limit}, Used={self.total_memory_usage}. Increasing by {diff} bytes.")
+        self.memory_limit += diff
+
     def add_field(self, field_name, data):
-        """Добавление поля в узел с указателем на данные."""
-        if self.fields_count < self.max_fields:
-            # Добавляем новое поле, если не достигнут лимит
-            self.data[field_name] = data
-            # Добавляем ID в fields_id
-            self.fields_id[self.fields_count * 16:(self.fields_count + 1) * 16] = self.generate_id_for_field(field_name)
-            self.fields_count += 1
-        else:
-            # Логика для динамического увеличения лимита количества полей
-            warning_message = f"WARNING: Field limit exceeded. Increasing limit from {self.max_fields} to {self.max_fields + 1}."
-            print(warning_message)  # Выводим предупреждение
-            self.max_fields += 1  # Увеличиваем лимит на 1
-            self.data[field_name] = data  # Добавляем поле
-            self.fields_count += 1
+        """Добавляет новое поле и пересчитывает память."""
+        if self.fields_count >= self.max_fields:
+            self.max_fields += 1
+            print(f"[INFO] Field limit increased to {self.max_fields}")
 
+        self.data[field_name] = data
+        field_size = self._get_object_size(data)
+        self.field_memory[field_name] = field_size
+        self.fields_count = len(self.data)
         self.update_memory_usage()
 
-    def generate_id_for_field(self, field_name):
-        """Генерация ID для поля (UUID, упакованный в 16 байт)."""
-        return uuid.uuid5(self.id, field_name).bytes
+        # Проверка на утечки/сборку мусора каждые 10 секунд
+        now = time.time()
+        if now - self.last_gc_check > 10:
+            gc.collect()
+            self.last_gc_check = now
+            self.update_memory_usage()
 
-    def raise_memory_limit_warning(self):
-        """Метод для вывода ясного предупреждения, если память превышена."""
-        # Вычисляем разницу, на которую нужно увеличить лимит
-        additional_memory = self.total_memory_usage - self.memory_limit
-        warning_message = f"WARNING: Memory usage exceeded the specified limit of {self.memory_limit} bytes. " \
-                          f"Current memory usage: {self.total_memory_usage} bytes. Increasing memory limit by {additional_memory} bytes."
-        print(warning_message)  # Выводим сообщение о предупреждении
-        # Увеличиваем лимит памяти на нужную величину
-        self.memory_limit += additional_memory
-        print(f"Memory limit increased to {self.memory_limit} bytes.")
+    def remove_field(self, field_name):
+        """Удаляет поле и корректирует учёт памяти."""
+        if field_name in self.data:
+            del self.data[field_name]
+            self.field_memory.pop(field_name, None)
+            self.fields_count -= 1
+            self.update_memory_usage()
 
-    def add_child(self, path, node):
-        """Добавление дочернего узла по указанному пути."""
-        parts = path.split('/')
-        current_node = self
-        for part in parts:
-            if part not in current_node.children:
-                current_node.children[part] = DataNode(self.max_fields, self.memory_limit)  # Передаем лимит памяти
-            current_node = current_node.children[part]
-        current_node = node
+    def add_child(self, name, node):
+        """Добавляет дочерний узел."""
+        self.children[name] = node
         self.update_memory_usage()
-
-    def resolve(self, path, id_map):
-        """Разрешение пути через ID для доступа к данным."""
-        parts = path.split('/')
-        current_node = self
-        for part in parts:
-            if part in current_node.children:
-                current_node = current_node.children[part]
-            else:
-                return None
-        return id_map.get(current_node.id, None)
 
     def get_total_memory_usage(self):
-        """Возвращает общий размер памяти, занимаемой узлом и его дочерними узлами."""
+        """Возвращает суммарное использование памяти, включая потомков."""
+        self.update_memory_usage()
         return self.total_memory_usage
 
-    def __repr__(self):
-        return f"DataNode(id={repr(self.id)}, data={repr(self.data)}, memory_usage={self.memory_usage}, total_memory_usage={self.total_memory_usage}, fields_count={self.fields_count}, children={repr(self.children)})"
+    # --- Отчёты и профилирование ---
+    def get_memory_report(self, deep=False):
+        """Возвращает подробный отчёт об использовании памяти."""
+        report = {
+            'node_id': str(self.id),
+            'fields': {k: f"{v} bytes" for k, v in self.field_memory.items()},
+            'total': f"{self.total_memory_usage} bytes"
+        }
+        if deep and self.children:
+            report['children'] = {k: v.get_memory_report(deep=True) for k, v in self.children.items()}
+        return report
 
+    def __repr__(self):
+        return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
 
 # Пример использования:
 
 # Создаем корневой узел с ограничением на 5 полей и лимитом памяти в 10000 байт
-root = Node(max_fields=5, memory_limit=10000)
+root = Node(max_fields=5, memory_limit=1000)
 
 # Определяем несколько функций для добавления
 def greet():
@@ -157,3 +153,5 @@ print(f"Total memory usage for root: {root.get_total_memory_usage()} bytes")
 
 # Печатаем структуру данных
 print(root)
+print()
+print(root.get_memory_report())
