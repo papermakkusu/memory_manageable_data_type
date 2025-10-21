@@ -8,7 +8,7 @@ import os
 import pickle
 import threading
 from multiprocessing import shared_memory, Manager, Process
-import atexit  # <-- added
+import atexit
 
 try:
     import memray
@@ -16,8 +16,11 @@ except ImportError:
     memray = None
 
 
-# ---------- Shared-memory-aware MemoryHeap ----------
-class _MemoryHeap:
+
+########################################################################################################################
+# XXX: MemoryHeap Class                                                                                                #
+########################################################################################################################
+class MemoryHeap:
     """
     Менеджер памяти, хранящий объекты по UUID-указателям
     в сегментах настоящей shared memory, доступных из разных процессов.
@@ -145,11 +148,19 @@ class _MemoryHeap:
         self.logger.info("[HEAP] Cleaned up all shared memory")
 
 
-# ---------- Node ----------
+########################################################################################################################
+# XXX: Node Class                                                                                                      #
+########################################################################################################################
 class Node:
-    def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None, shared_maps=None, data_refs=None):
+    def __init__(self,
+                 max_fields=10,
+                 memory_limit=None,
+                 warn_threshold=0.8,
+                 logger=None,
+                 shared_maps=None,
+                 data_refs=None):
         self.logger = logger or self._create_default_logger()
-        self.heap = _MemoryHeap(self.logger, shared_maps=shared_maps)
+        self.heap = MemoryHeap(self.logger, shared_maps=shared_maps)
 
         self.max_fields = max_fields
         self.memory_limit = memory_limit
@@ -232,7 +243,6 @@ class Node:
     def add_field(self, field_name, value):
         if field_name in self.data:
             return self.set_field_value(field_name, value)
-
         ptr = self.heap.alloc(value)
         self.data[field_name] = ptr
         self.field_memory[field_name] = self._get_object_size(value)
