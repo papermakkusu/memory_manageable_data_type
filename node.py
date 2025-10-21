@@ -207,7 +207,7 @@ node = Node(memory_limit=5_000_000)
 node.start_memray_tracking("test_memray.bin")
 
 # создаём нагрузку
-node.big_list = [x for x in range(10_0000)])
+node.big_list = [x for x in range(10_0000)]
 node.field_int = 42  # Целое число
 node.field_str = "Hello, world!"  # Строка
 node.field_list = [1, 2, 3, 4, 5]  # Список
