@@ -3,8 +3,7 @@ import sys
 import logging
 import os
 import pickle
-import threading
-from multiprocessing import shared_memory, Manager, Process
+from multiprocessing import shared_memory, Manager, Process, RLock
 import atexit
 
 try:
@@ -25,7 +24,7 @@ class _Heap:
     SLAB_SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
     def __init__(self, logger=None, shared_maps=None):
-        self.lock = threading.Lock()
+        self.lock = RLock()
         # NOTE: Free slabs
         self._free_blocks = {size: [] for size in self.SLAB_SIZES}
         # NOTE: Shared dicts (for multiprocess interactions)
@@ -34,7 +33,7 @@ class _Heap:
         else:
             self._shm_map, self._size_map = {}, {}
         self.logger = logger or self._create_default_logger()
-        # NOTE: Cleanup all shared memory on process exit
+        # NOTE: Register cleanup at exit
         atexit.register(self._cleanup_all)
 
     def _choose_slab_size(self, size):
@@ -62,19 +61,24 @@ class _Heap:
         return pickle.loads(buf)
 
     def alloc(self, obj):
-        """ Stores an object in shared memory and returnes UUID-pointer."""
-        u = uuid.uuid4()
         data = self._serialize(obj)
-        size = len(data)
-        shm = shared_memory.SharedMemory(create=True, size=size)
-        shm.buf[:size] = data
+        size_needed = len(data)
+        slab_size = self._choose_slab_size(size_needed)
 
         with self.lock:
-            self._shm_map[str(u)] = shm.name
-            self._size_map[str(u)] = size
+            if slab_size in self._free_blocks and self._free_blocks[slab_size]:
+                shm = self._free_blocks[slab_size].pop()
+            else:
+                shm = shared_memory.SharedMemory(create=True, size=slab_size)
+
+        shm.buf[:size_needed] = data
+        u = uuid.uuid4()
+        with self.lock:
+            self._shm_map[str(u)] = (shm.name, slab_size)
+            self._size_map[str(u)] = size_needed
 
         shm.close()
-        self.logger.debug(f"[HEAP] Allocated {u} -> {type(obj).__name__} ({size} bytes)")
+        self.logger.debug(f"[HEAP] Allocated {u} ({size_needed} bytes in slab {slab_size})")
         return u
 
     def read(self, ptr):
@@ -92,40 +96,44 @@ class _Heap:
         return obj
 
     def write(self, ptr, value):
-        """ Writes an object with UUID to shared memory."""
         key = str(ptr)
         with self.lock:
-            shm_name = self._shm_map.get(key)
-            if shm_name is None:
-                raise KeyError(f"Invalid memory pointer: {ptr}")
+            shm_name, slab_size = self._shm_map[key]
         data = self._serialize(value)
-        size = len(data)
-        shm = shared_memory.SharedMemory(name=shm_name)
-        if size > shm.size:
-            shm.close()
-            shm.unlink()
-            shm = shared_memory.SharedMemory(create=True, size=size)
+        size_needed = len(data)
+
+        if size_needed <= slab_size:
+            # reuse existing block
+            shm = shared_memory.SharedMemory(name=shm_name)
+        else:
+            # return old block to free list if it fits
             with self.lock:
-                self._shm_map[key] = shm.name
-                self._size_map[key] = size
-        shm.buf[:size] = data
+                for s in self.SLAB_SIZES:
+                    if s >= slab_size:
+                        self._free_blocks[s].append(shared_memory.SharedMemory(name=shm_name, create=False))
+                        break
+            # allocate new slab
+            slab_size = self._choose_slab_size(size_needed)
+            shm = shared_memory.SharedMemory(create=True, size=slab_size)
+
+        shm.buf[:size_needed] = data
         shm.close()
-        self.logger.debug(f"[HEAP] Updated {ptr} → {type(value).__name__} ({size} bytes)")
+        with self.lock:
+            self._shm_map[key] = (shm.name, slab_size)
+            self._size_map[key] = size_needed
+        self.logger.debug(f"[HEAP] Updated {ptr} ({size_needed} bytes in slab {slab_size})")
 
     def free(self, ptr):
-        """ Frees up a segment of shared memory."""
         key = str(ptr)
         with self.lock:
-            shm_name = self._shm_map.pop(key, None)
+            info = self._shm_map.pop(key, None)
             self._size_map.pop(key, None)
-        if shm_name:
-            try:
-                shm = shared_memory.SharedMemory(name=shm_name)
-                shm.close()
-                shm.unlink()
-                self.logger.debug(f"[HEAP] Freed memory at {ptr}")
-            except FileNotFoundError:
-                pass
+        if info:
+            shm_name, slab_size = info
+            # instead of unlink, add to free blocks
+            with self.lock:
+                self._free_blocks[slab_size].append(shared_memory.SharedMemory(name=shm_name, create=False))
+            self.logger.debug(f"[HEAP] Freed {ptr} (added to slab pool {slab_size})")
 
     def cleanup(self, active_pointers):
         """ Ramoves all entities not listed in active_pointers."""
@@ -139,19 +147,51 @@ class _Heap:
             return list(self._shm_map.keys())
 
     def _cleanup_all(self):
-        """ Cleans up all shared memory at python process exit."""
+        """Cleanup all allocated and free shared memory blocks."""
         with self.lock:
-            for key, shm_name in list(self._shm_map.items()):
+            # Cleanup active blocks
+            for key, info in list(self._shm_map.items()):
                 try:
+                    shm_name, slab_size = info
                     shm = shared_memory.SharedMemory(name=shm_name)
                     shm.close()
                     shm.unlink()
                     self.logger.debug(f"[HEAP] Auto-freed shared memory {key}")
                 except FileNotFoundError:
                     pass
+                except Exception as e:
+                    self.logger.error(f"[HEAP] Failed to cleanup {key}: {e}")
             self._shm_map.clear()
             self._size_map.clear()
-        self.logger.info("[HEAP] Cleaned up all shared memory")
+
+            # Cleanup free slabs (prevent leaks from pool)
+            for slab_size, shm_list in self._free_blocks.items():
+                for shm in shm_list:
+                    try:
+                        shm.close()
+                        shm.unlink()
+                        self.logger.debug(f"[HEAP] Freed pooled slab of size {slab_size}")
+                    except FileNotFoundError:
+                        pass
+                    except Exception as e:
+                        self.logger.error(f"[HEAP] Failed to cleanup free slab: {e}")
+                self._free_blocks[slab_size] = []
+        self.logger.info("[HEAP] Cleaned up all shared memory including pooled slabs")
+
+    # Optional: context manager for explicit cleanup
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._cleanup_all()
+
+    # Optional: destructor as last-resort safety
+    def __del__(self):
+        try:
+            self._cleanup_all()
+        except Exception:
+            # Ignore errors during interpreter shutdown
+            pass
 
 ########################################################################################################################
 # XXX: Node Class                                                                                                      #
@@ -165,7 +205,7 @@ class Node:
                  shared_maps=None,
                  data_refs=None):
         self.logger = logger or self._create_default_logger()
-        self.heap = _Heap(self.logger, shared_maps=shared_maps)
+        self.heap = _Heap(shared_maps=shared_maps)
         self.max_fields = max_fields
         self.memory_limit = memory_limit
         self.warn_threshold = warn_threshold
@@ -173,7 +213,6 @@ class Node:
         self.field_memory = {}      # field_name -> size
         self.children = {}          # child_name -> Node
         self.id = uuid.uuid4()
-        self.fields_count = 0
         self.memory_usage = 0
         self.total_memory_usage = 0
         self._memray_tracker = None
@@ -193,41 +232,35 @@ class Node:
         return {k: str(v) for k, v in self.data.items()}
 
     def __getattr__(self, name):
-        # Ensure the field exists
         if name not in self.data:
             self.add_field(name, None)
 
         ptr = self.data[name]
-
-        # Safe access to cache and digest
         cache = super().__getattribute__('_cache')
         cache_digest = super().__getattribute__('_cache_digest')
 
-        # Read raw bytes from shared memory
-        shm_name = self.heap._shm_map[str(ptr)]
+        # Unpack tuple: (shm_name, slab_size)
+        shm_name, slab_size = self.heap._shm_map[str(ptr)]
         size = self.heap._size_map[str(ptr)]
+
         shm = shared_memory.SharedMemory(name=shm_name)
         buf = bytes(shm.buf[:size])
         shm.close()
 
         digest = hash(buf)
 
-        # Return cached value if memory hasn't changed
         if name in cache and cache_digest.get(name) == digest:
             return cache[name]
 
-        # Otherwise deserialize and update cache
         value = self.heap._deserialize(buf)
         cache[name] = value
         cache_digest[name] = digest
-
         return value
 
     def __setattr__(self, name, value):
         reserved = {
-            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory', 'fields_count', 'children', 'id',
-            'memory_usage', 'total_memory_usage', 'logger', '_memray_tracker', '_memray_report_path', 'heap', '_cache',
-            '_cache_digest',
+            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory', 'children', 'id', 'memory_usage',
+            'total_memory_usage', 'logger', '_memray_tracker', '_memray_report_path', 'heap', '_cache', '_cache_digest',
         }
         if name in reserved:
             super().__setattr__(name, value)
@@ -266,7 +299,6 @@ class Node:
         ptr = self.heap.alloc(value)
         self.data[field_name] = ptr
         self.field_memory[field_name] = self._get_object_size(value)
-        self.fields_count = len(self.data)
         self.update_memory_usage()
 
     def set_field_value(self, field_name, value):
@@ -330,32 +362,40 @@ class Node:
         os.system(f"memray flamegraph {self._memray_report_path} -o {html_path}")
         self.logger.info(f"[MEMRAY] HTML report generated → {html_path}")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # NOTE: Cleanup shared memory
+        self.heap._cleanup_all()
+
 
 if __name__ == "__main__":
+
+    import time
 
     ####################################################################################################################
     # XXX:  Examples                                                                                                   #
     ####################################################################################################################
     def child(shared_maps, data_refs):
         node = Node(shared_maps=shared_maps, data_refs=data_refs)
-        print("\n[Child] Modifying shared data...")
-        node.field_str = "Hello, child!"
+        print("[Child] Before:", node.field_str)
+        node.field_str = "Modified by child!"
+        print("[Child] After:", node.field_str)
+        time.sleep(1)  # allow Manager to sync
+        node.heap.logger.info("[Child] Done updating shared memory")
 
-    manager = Manager()
-    shared_maps = (manager.dict(), manager.dict())
+    if __name__ == "__main__":
+        manager = Manager()
+        shared_maps = (manager.dict(), manager.dict())  # shared proxy dicts
+        with Node(shared_maps=shared_maps) as node:
+            node.field_str = "Hello, parent!"
+            print("[Parent] Before:", node.field_str)
 
-    node = Node(memory_limit=300, shared_maps=shared_maps)
-    node.field_str = "Hello, world!"
+            p = Process(target=child, args=(shared_maps, node.data_refs))
+            p.start()
+            p.join()
 
-    print("\n[Parent] Before child modification:")
-    print(node.field_str)
-
-    # NOTE: Access same shared memory from child process
-    p = Process(target=child, args=(shared_maps, node.data_refs))
-    p.start()
-    p.join()
-
-    print("\n[Parent] After child modification:")
-    print(node.field_str)
-
-    print("\n[MEMORY REPORT]", node.get_memory_report())
+            # Give a moment for manager sync before reading
+            time.sleep(0.5)
+            print("[Parent] After child:", node.field_str)
