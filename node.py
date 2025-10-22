@@ -15,8 +15,50 @@ except ImportError:
 
 
 
-# XXX: Node class: high-level API using Heap for memory management
 class Node:
+    """A high-level shared-memory object container built on top of Heap.
+
+    The Node class represents a structured, reference-counted data container that stores its fields in a shared-memory
+    `Heap`. It provides a dynamic, dictionary-like interface for defining and manipulating named fields whose values
+    live in shared memory, allowing multiple processes to access and modify them concurrently.
+
+    Each Node instance maintains:
+      • A mapping of field names to shared-memory pointers (UUIDs)
+      • Per-field memory usage and insertion order
+      • Optional child Nodes for hierarchical composition
+      • A shared reference to the underlying Heap metadata maps
+      • Internal caches for deserialized values to reduce read overhead
+
+    When a field is assigned (e.g., `node.value = [1, 2, 3]`), the Node automatically serializes the data and allocates
+    space for it in the Heap. When read (e.g., `print(node.value)`), the value is transparently deserialized from shared
+    memory (and cached if unchanged). Reference counts are tracked across all Nodes referencing the same pointer,
+    allowing safe concurrent sharing and deferred cleanup via the Heap's garbage collector.
+
+    Design:
+      - Each Node owns a subset of shared-memory objects managed by a common Heap.
+      - Attributes that are not internal (not starting with `_`) are interpreted as fields and automatically mapped
+        to shared memory.
+      - The `shared_maps` and `data_refs` interfaces enable serialization-free sharing of Node state between processes.
+      - Memory usage is continuously tracked; configurable thresholds trigger warnings when approaching `memory_limit`.
+
+    Example:
+        >>> from multiprocessing import Manager
+        >>> node = Node(manager=Manager())
+        >>> node.message = "Hello from shared memory"
+        >>> node.numbers = [1, 2, 3]
+
+        >>> print(node.message)
+        Hello from shared memory
+
+        >>> child = Node(shared_maps=node.shared_maps, data_refs=node.data_refs)
+        >>> print(child.message)
+        Hello from shared memory
+
+        >>> child.message = "Modified by child"
+        >>> print(node.message)
+        Modified by child
+    """
+
     def __init__(self, max_fields=10, memory_limit=None, warn_threshold=0.8, logger=None, shared_maps=None,
                  data_refs=None, manager=None, allow_field_creation=True, use_events=True, parent_gc=True):
 
@@ -50,7 +92,7 @@ class Node:
 
         # NOTE: Heap
         super().__setattr__('heap', Heap(logger=self.logger, shared_maps=shared_maps, manager=self.manager,
-                                        use_events=use_events, parent_gc=parent_gc))
+                                         use_events=use_events, parent_gc=parent_gc))
 
         # NOTE: Internal bookkeeping
         super().__setattr__('max_fields', max_fields)
@@ -107,12 +149,12 @@ class Node:
         if name not in data:
             raise AttributeError(f"Field '{name}' not found. Automatic creation is disabled.")
 
-        ptr = data[name]
-        key = str(ptr)
+        pointer = data[name]
+        key = str(pointer)
         shm_info = super().__getattribute__('heap')._shm_map.get(key)
 
         if shm_info is None:
-            val = super().__getattribute__('heap').read(ptr)
+            val = super().__getattribute__('heap').read(pointer)
             cache[name] = val
             cache_digest[name] = None
             return val
@@ -123,7 +165,7 @@ class Node:
             shm_name = shm_info
         size = super().__getattribute__('heap')._size_map.get(key)
         if size is None:
-            val = super().__getattribute__('heap').read(ptr)
+            val = super().__getattribute__('heap').read(pointer)
             cache[name] = val
             cache_digest[name] = None
             return val
@@ -162,15 +204,12 @@ class Node:
     def _is_reserved_attr(self, name):
         """Check if name is a reserved internal attribute to bypass Heap"""
         reserved = {
-            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory',
-            'field_index', 'fields_count', 'children', 'id', 'memory_usage', 'total_memory_usage',
-            'last_gc_check', 'logger', '_memray_tracker', '_memray_report_path',
-            '_fields_id_buf', 'fields_id', 'heap', '_cache', '_cache_digest',
-            'add_field', 'set_field_value', 'get_field_value', 'remove_field',
-            'get_memory_report', 'get_total_memory_usage', 'start_memray_tracking',
-            'stop_memray_tracking', 'print_memray_report', 'export_shared_refs',
-            'attach_shared_refs', 'cleanup_unused_memory', '__repr__',
-            '__getattr__', '__setattr__', '__init__', 'data_refs'
+            'max_fields', 'memory_limit', 'warn_threshold', 'data', 'field_memory', 'field_index', 'fields_count',
+            'children', 'id', 'memory_usage', 'total_memory_usage', 'last_gc_check', 'logger', '_memray_tracker',
+            '_memray_report_path', '_fields_id_buf', 'fields_id', 'heap', '_cache', '_cache_digest', 'add_field',
+            'set_field_value', 'get_field_value', 'remove_field', 'get_memory_report', 'get_total_memory_usage',
+            'start_memray_tracking', 'stop_memray_tracking', 'print_memray_report', 'export_shared_refs', 'data_refs',
+            'attach_shared_refs', 'cleanup_unused_memory', '__repr__', '__getattr__', '__setattr__', '__init__',
         }
         if name.startswith('_'):
             return True
@@ -182,8 +221,8 @@ class Node:
         """Add a new field to the Node and allocate memory in Heap"""
         if field_name in self.data:
             return self.set_field_value(field_name, value)
-        ptr = self.heap.alloc(value)
-        self.data[field_name] = ptr  # NOTE: store pointer
+        pointer = self.heap.alloc(value)
+        self.data[field_name] = pointer  # NOTE: store pointer
         self.field_memory[field_name] = self._get_object_size(value)  # NOTE: track memory usage
         self.field_index[field_name] = len(self.field_index)  # NOTE: store insertion order
         self.fields_count = len(self.data)
@@ -193,25 +232,25 @@ class Node:
         """Update existing field value in shared memory"""
         if field_name not in self.data:
             return self.add_field(field_name, value)
-        ptr = self.data[field_name]
-        self.heap.write(ptr, value)  # NOTE: overwrite Heap memory
+        pointer = self.data[field_name]
+        self.heap.write(pointer, value)  # NOTE: overwrite Heap memory
         self.field_memory[field_name] = self._get_object_size(value)
         self.update_memory_usage()  # NOTE: update Node memory accounting
 
     def get_field_value(self, field_name):
         """Return field value from Heap"""
-        ptr = self.data.get(field_name)
-        return self.heap.read(ptr) if ptr else None
+        pointer = self.data.get(field_name)
+        return self.heap.read(pointer) if pointer else None
 
     def remove_field(self, field_name):
         """Remove a field, decrement refcount, and cleanup memory"""
         if field_name not in self.data:
             return
-        ptr = self.data.pop(field_name)
+        pointer = self.data.pop(field_name)
         try:
-            self.heap.dec_ref(ptr)  # NOTE: decrement reference count; GC may reclaim
+            self.heap.dec_ref(pointer)  # NOTE: decrement reference count; GC may reclaim
         except Exception as e:
-            self.logger.warning(f"[REMOVE] heap.dec_ref failed for {ptr}: {e}")
+            self.logger.warning(f"[REMOVE] heap.dec_ref failed for {pointer}: {e}")
         self.field_memory.pop(field_name, None)
         self.field_index.pop(field_name, None)
         if '_cache' in self.__dict__:
@@ -264,7 +303,7 @@ class Node:
     def get_memory_report(self, deep=False):
         """Return memory report for Node; deep=True includes children recursively"""
         report = {"node_id": str(self.id),
-                  "fields": {k: {"size_bytes": v, "ptr": str(self.data[k]), "index": self.field_index.get(k)}
+                  "fields": {k: {"size_bytes": v, "pointer": str(self.data[k]), "index": self.field_index.get(k)}
                              for k, v in self.field_memory.items()},
                   "total": f"{self.total_memory_usage} bytes"}
         if deep and self.children:
@@ -279,21 +318,8 @@ class Node:
     def __repr__(self):
         return f"<Node id={self.id} fields={self.fields_count} mem={self.total_memory_usage}B>"
 
-# if __name__ == "__main__":
-#     node = Node(manager=Manager())
-#     node.field_str = "Hello, world!"
-#     print("[parent] before child:", node.field_str)
-#
-#     def child_proc(shared_maps, data_refs):
-#         node_c = Node(shared_maps=shared_maps, data_refs=data_refs)
-#         print("[child] before:", node_c.field_str)
-#         node_c.field_str = "Modified by child"
-#         print("[child] after:", node_c.field_str)
-#
-#     p = Process(target=child_proc, args=(node.shared_maps, node.data_refs))
-#     p.start()
-#     p.join()
-#
-#     print("[parent] after child:", node.field_str)
-#     node.remove_field("field_str")
-#     print("removed. present?", "field_str" in node.data)
+if __name__ == "__main__":
+    import doctest
+
+    doctest.testmod()
+    print("Doctests completed!")
