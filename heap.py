@@ -11,8 +11,31 @@ from multiprocessing import shared_memory, Manager, Process
 
 
 
-# XXX: Heap class manages shared memory allocation + GC
 class Heap:
+    """A process-safe shared memory manager with automatic garbage collection.
+
+    The Heap class provides a high-level abstraction for allocating, storing, and managing Python objects in shared
+    memory across multiple processes. Each allocated object is serialized (via `pickle`) and stored in a dedicated
+    `multiprocessing.shared_memory.SharedMemory` block, identified by a unique UUID-based pointer. This design allows
+    independent processes to share complex Python data structures without copying or using sockets.
+
+    Internally, Heap maintains several cross-process dictionaries (managed by `multiprocessing.Manager`) that track:
+      - shared memory names and sizes
+      - object versions (timestamps)
+      - reference counts
+      - optional write-in-progress events
+      - free block metadata
+
+    These maps act as a lightweight shared-memory metadata registry. Reference counts are used to determine object
+    lifetime. When a pointer’s reference count drops to zero, a background garbage collector (GC) thread reclaims its
+    memory after a configurable grace period (`GC_GRACE`), ensuring that concurrent readers finish before freeing the
+    block.
+
+    The Heap can be run in “parent GC” mode, where only one instance performs garbage collection across processes,
+    or in child mode, where instances rely on the parent to perform cleanup. All operations — allocation, read, write,
+    reference management, and freeing — are synchronized using a thread- or process-level lock for data integrity.
+    """
+
     GC_INTERVAL = 1.0  # NOTE: GC loop interval in seconds
     GC_GRACE = 2.0  # NOTE: grace period before freeing zero-ref memory
 
@@ -31,7 +54,7 @@ class Heap:
         self.use_events = use_events
         self.parent_gc = parent_gc
 
-        # XXX Initialize shared maps (six components)
+        # NOTE: Initialize shared maps (six components)
         if shared_maps:
             if len(shared_maps) == 6:
                 (self._shm_map,       # NOTE: pointer -> shared_memory name
@@ -98,7 +121,7 @@ class Heap:
         key = str(uuid.uuid4())  # NOTE: generate unique pointer ID
         now = time.time()
         with self._lock():
-            # XXX Register allocation in shared maps
+            # NOTE: Register allocation in shared maps
             self._shm_map[key] = shm.name
             self._size_map[key] = size
             self._version_map[key] = now
@@ -114,10 +137,10 @@ class Heap:
         key = str(ptr)
         # NOTE: optional wait if write-in-progress
         if wait_for_write and self.use_events:
-            ev = self._event_map.get(key)
-            if ev:
+            event = self._event_map.get(key)
+            if event:
                 start = time.time()
-                while ev.is_set():
+                while event.is_set():
                     if time.time() - start > timeout:
                         break
                     time.sleep(0.01)
@@ -144,12 +167,12 @@ class Heap:
             current_size = self._size_map.get(key)
             if shm_name is None:
                 raise KeyError(f"Invalid pointer: {key}")
-            ev = self._event_map.get(key) if self.use_events else None
-            if ev is None and self.use_events:
-                ev = self.manager.Event()
-                self._event_map[key] = ev
-            if ev:
-                ev.set()  # mark write-in-progress
+            event = self._event_map.get(key) if self.use_events else None
+            if event is None and self.use_events:
+                event = self.manager.Event()
+                self._event_map[key] = event
+            if event:
+                event.set()  # mark write-in-progress
 
         try:
             if size_needed <= current_size:
@@ -179,8 +202,8 @@ class Heap:
                 except Exception:
                     pass
         finally:
-            if ev:
-                ev.clear()  # NOTE: write complete
+            if event:
+                event.clear()  # NOTE: write complete
 
         self.logger.debug(f"[write] {key} size={size_needed} ver={now}")
 
@@ -210,9 +233,9 @@ class Heap:
             self._size_map.pop(key, None)
             self._version_map.pop(key, None)
             self._refcount_map.pop(key, None)
-            ev = self._event_map.pop(key, None)
-        if ev:
-            ev.clear()
+            event = self._event_map.pop(key, None)
+        if event:
+            event.clear()
         if shm_name:
             try:
                 shm = shared_memory.SharedMemory(name=shm_name)
